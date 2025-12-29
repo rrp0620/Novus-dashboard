@@ -1,108 +1,99 @@
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# --- 1. SETUP & PAGE CONFIG ---
+# --- 1. SETUP ---
 st.set_page_config(page_title="Novus Dashboard", page_icon="🗝️", layout="centered")
 
-# Retrieve keys from Streamlit Secrets
+# Retrieve Keys
 try:
     API_KEY = st.secrets["API_KEY"]
     SECRET_KEY = st.secrets["SECRET_KEY"]
-except FileNotFoundError:
-    st.error("❌ Secrets missing! Go to App Settings > Secrets to add them.")
+except:
+    st.error("❌ Secrets missing. Please check your Streamlit settings.")
     st.stop()
 
-# --- 2. CONNECT TO GOOGLE SHEETS (EXPENSES) ---
-# ⚠️ REPLACE THIS ID WITH YOUR OWN GOOGLE SHEET ID ⚠️
-SHEET_ID = "1x_YOUR_ACTUAL_SHEET_ID_GOES_HERE_x1" 
+# GOOGLE SHEET CONFIG (Replace with your ID)
+SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
 EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
-# --- 3. DATA FUNCTIONS ---
-
-@st.cache_data(ttl=600)  # Refreshes data every 10 minutes
+# --- 2. THE TIME MACHINE (FETCH DATA) ---
+@st.cache_data(ttl=600)
 def get_bookeo_data():
-    """Fetches the last 100 bookings from Bookeo"""
-    url = f"https://api.bookeo.com/v2/bookings?apiKey={API_KEY}&secretKey={SECRET_KEY}&itemsPerPage=100"
+    # 1. Calculate dates: Look back 30 days from today
+    end_date = datetime.utcnow()
+    start_date = end_date - timedelta(days=30)
+    
+    # 2. Format dates for Bookeo (ISO 8601 format)
+    # Bookeo requires: YYYY-MM-DDTHH:mm:ssZ
+    start_str = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 3. Build the URL
+    url = (f"https://api.bookeo.com/v2/bookings"
+           f"?apiKey={API_KEY}"
+           f"&secretKey={SECRET_KEY}"
+           f"&startTime={start_str}"
+           f"&endTime={end_str}"
+           f"&itemsPerPage=300") # Max limit per call
+
     try:
         response = requests.get(url)
         if response.status_code == 200:
             return response.json().get('data', [])
         else:
+            # If it fails, we show the EXACT error message on screen
+            st.error(f"⚠️ Connection Error {response.status_code}: {response.text}")
             return []
-    except:
+    except Exception as e:
+        st.error(f"⚠️ System Error: {e}")
         return []
 
 def get_expenses():
-    """Fetches expenses from your Google Sheet"""
     try:
-        # We try to read the sheet. If it's empty or fails, return an empty table.
         df = pd.read_csv(SHEET_URL)
-        # Clean up currency symbols if you typed them in the sheet manually
         if 'Amount' in df.columns:
             df['Amount'] = df['Amount'].replace('[\$,]', '', regex=True).astype(float)
         return df
     except:
-        # Returns an empty dataframe if the sheet is new/blank
-        return pd.DataFrame(columns=["Date", "Category", "Amount", "Notes"])
+        return pd.DataFrame(columns=["Date", "Category", "Amount"])
 
-# --- 4. DASHBOARD LOGIC ---
-
+# --- 3. DASHBOARD DISPLAY ---
 st.title("🗝️ Novus Performance")
+st.caption("Showing data for the last 30 days")
 
-# A. Load Data
-with st.spinner('Syncing with Bookeo & Google...'):
+with st.spinner('Syncing data...'):
     bookings = get_bookeo_data()
     expenses = get_expenses()
 
-# B. Calculate Revenue (Bookeo)
+# CALCULATIONS
 total_revenue = 0.0
 if bookings:
-    # Extracts the price from the complex Bookeo format
-    total_revenue = sum([float(b.get('finalPrice', {}).get('amount', 0)) for b in bookings])
+    for b in bookings:
+        # Check if price exists and is not cancelled
+        price_info = b.get('finalPrice', {})
+        if price_info:
+            total_revenue += float(price_info.get('amount', 0))
 
-# C. Calculate Expenses (Google Sheet)
-total_expenses = 0.0
-if not expenses.empty and 'Amount' in expenses.columns:
-    total_expenses = expenses['Amount'].sum()
-
-# D. Calculate Profit
+total_expenses = expenses['Amount'].sum() if not expenses.empty and 'Amount' in expenses.columns else 0
 net_profit = total_revenue - total_expenses
 
-# --- 5. VISUALS ---
-
-# Top Metrics
+# METRICS
 col1, col2, col3 = st.columns(3)
-col1.metric("Revenue", f"${total_revenue:,.0f}")
+col1.metric("Revenue (30d)", f"${total_revenue:,.0f}")
 col2.metric("Expenses", f"${total_expenses:,.0f}")
-col3.metric("Net Profit", f"${net_profit:,.0f}", delta_color="normal")
+col3.metric("Net Profit", f"${net_profit:,.0f}")
 
 st.divider()
 
-# Expense Section
-st.subheader("💸 Expense Tracking")
-if expenses.empty:
-    st.info("No expenses found. Click 'Add Expenses' to start your sheet!")
-else:
-    # Bar Chart of Spending
-    st.bar_chart(expenses.groupby("Category")["Amount"].sum())
-
-# Action Button: Open Google Sheet to Edit
-st.link_button("➕ Add/Edit Expenses (Opens Google Sheets)", EDIT_LINK)
-
-# Recent Bookings Section
-st.divider()
-with st.expander("See Recent Bookings"):
+# RAW DATA CHECK (For Debugging)
+with st.expander("🔍 Debug: View Raw Booking Data"):
     if bookings:
-        simple_data = []
-        for b in bookings:
-            simple_data.append({
-                "Date": b.get('startTime', '')[:10],
-                "Name": b.get('customer', {}).get('firstName', 'Unknown'),
-                "Price": f"${b.get('finalPrice', {}).get('amount', '0')}"
-            })
-        st.table(pd.DataFrame(simple_data))
+        st.write(f"Found {len(bookings)} bookings in the last 30 days.")
+        st.dataframe(pd.DataFrame(bookings))
     else:
-        st.write("No recent bookings found.")
+        st.warning("No bookings found in this date range (or connection failed).")
+
+st.link_button("➕ Manage Expenses", EDIT_LINK)
