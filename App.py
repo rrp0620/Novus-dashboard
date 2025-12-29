@@ -14,7 +14,7 @@ SECRET_KEY = st.secrets["SECRET_KEY"]
 @st.cache_data(ttl=600)  # Refreshes every 10 minutes
 def get_bookeo_data():
     """Fetches bookings from Bookeo API"""
-    url = f"https://api.bookeo.com/v2/bookings?apiKey={API_KEY}&secretKey={SECRET_KEY}&itemsPerPage=100"
+    url = f"https://api.bookeo.com/v2/settings/apikeyinfo?apiKey={API_KEY}&secretKey={SECRET_KEY}"
     try:
         response = requests.get(url)
         if response.status_code == 200:
