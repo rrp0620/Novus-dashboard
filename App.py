@@ -9,8 +9,8 @@ st.set_page_config(page_title="Novus Dashboard", layout="wide")
 st.title("🗝️ Novus Escape Room Performance")
 
 # Replace these with your actual keys from Bookeo
-API_KEY = "YOUR_API_KEY_HERE"
-SECRET_KEY = "YOUR_SECRET_KEY_HERE"
+API_KEY = "AJNJNEFLU4ML66339FF9J415703EJAR9166F64C9036"
+SECRET_KEY = "y6Ry3shNdaAKYUtGkYRnf8OLbhU2ad2td"
 EXPENSE_FILE = "expenses.csv"
 
 # --- 2. DATA LOADING (BOOKEO API) ---
