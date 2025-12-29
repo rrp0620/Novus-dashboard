@@ -2,77 +2,76 @@ import streamlit as st
 import pandas as pd
 import requests
 from datetime import datetime
-import os
 
-# --- 1. SETUP & CONFIGURATION ---
-st.set_page_config(page_title="Novus Dashboard", layout="wide")
-st.title("🗝️ Novus Escape Room Performance")
+# --- 1. SETTINGS & CONNECTIONS ---
+st.set_page_config(page_title="Novus Dashboard", page_icon="🗝️", layout="centered")
 
-# Replace these with your actual keys from Bookeo
-API_KEY = "AJNJNEFLU4ML66339FF9J415703EJAR9166F64C9036"
-SECRET_KEY = "y6Ry3shNdaAKYUtGkYRnf8OLbhU2ad2td"
-EXPENSE_FILE = "expenses.csv"
+# Pulling the keys you just saved in Streamlit Secrets
+API_KEY = st.secrets["API_KEY"]
+SECRET_KEY = st.secrets["SECRET_KEY"]
 
-# --- 2. DATA LOADING (BOOKEO API) ---
+# --- 2. THE DATA ENGINE ---
+@st.cache_data(ttl=600)  # Refreshes every 10 minutes
 def get_bookeo_data():
-    # This fetches bookings from the last 30 days
-    url = f"https://api.bookeo.com/v2/bookings?apiKey={API_KEY}&secretKey={SECRET_KEY}"
+    """Fetches bookings from Bookeo API"""
+    url = f"https://api.bookeo.com/v2/bookings?apiKey={API_KEY}&secretKey={SECRET_KEY}&itemsPerPage=100"
     try:
         response = requests.get(url)
         if response.status_code == 200:
-            data = response.json().get('data', [])
-            return pd.DataFrame(data)
+            return response.json().get('data', [])
         else:
-            st.error("Failed to connect to Bookeo. Check your API keys.")
-            return pd.DataFrame()
+            st.error(f"Bookeo Error: {response.status_code}. Check your Secrets!")
+            return []
     except Exception as e:
-        st.error(f"Error: {e}")
-        return pd.DataFrame()
+        st.error(f"Connection Error: {e}")
+        return []
 
-# --- 3. EXPENSE MANAGEMENT ---
-if not os.path.exists(EXPENSE_FILE):
-    df_empty = pd.DataFrame(columns=["Date", "Category", "Amount"])
-    df_empty.to_csv(EXPENSE_FILE, index=False)
+# --- 3. THE DASHBOARD LOGIC ---
+st.title("🗝️ Novus Performance")
 
-def add_expense(date, category, amount):
-    new_data = pd.DataFrame([[date, category, amount]], columns=["Date", "Category", "Amount"])
-    new_data.to_csv(EXPENSE_FILE, mode='a', header=False, index=False)
+data = get_bookeo_data()
 
-# --- 4. SIDEBAR - INPUT EXPENSES ---
-st.sidebar.header("Add Expenses")
-with st.sidebar.form("expense_form", clear_on_submit=True):
-    exp_date = st.date_input("Date Paid")
-    exp_cat = st.selectbox("Category", ["Rent", "Labor", "Electric", "Gas", "Water", "Insurance", "Other"])
-    exp_amt = st.number_input("Amount ($)", min_value=0.0, step=10.0)
-    submit = st.form_submit_button("Save Expense")
-    
-    if submit:
-        add_expense(exp_date, exp_cat, exp_amt)
-        st.sidebar.success("Expense Saved!")
-
-# --- 5. DASHBOARD CALCULATIONS ---
-bookings = get_bookeo_data()
-expenses = pd.read_csv(EXPENSE_FILE)
-
-# Calculate Totals
-total_revenue = 0
-if not bookings.empty:
-    # This logic assumes 'finalPrice' exists in the Bookeo JSON
-    total_revenue = bookings['finalPrice'].apply(lambda x: float(x.get('amount', 0))).sum()
-
-total_expenses = expenses['Amount'].sum()
-net_profit = total_revenue - total_expenses
-
-# --- 6. VISUALS ---
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Revenue", f"${total_revenue:,.2f}")
-col2.metric("Total Expenses", f"${total_expenses:,.2f}", delta_color="inverse")
-col3.metric("Net Profit", f"${net_profit:,.2f}")
-
-st.divider()
-
-st.subheader("Expense Breakdown")
-if not expenses.empty:
-    st.bar_chart(expenses.set_index("Category")["Amount"])
+if not data:
+    st.warning("No booking data found. If you just opened, this is normal!")
+    total_revenue = 0.0
 else:
-    st.info("No expenses recorded yet. Use the sidebar to add some!")
+    # Bookeo stores price as {'amount': '150.00', 'currency': 'USD'}
+    # This line extracts just the number so we can add it up
+    prices = [float(b.get('finalPrice', {}).get('amount', 0)) for b in data]
+    total_revenue = sum(prices)
+
+# --- 4. EXPENSE TRACKING (Manual Input) ---
+# For now, we use a simple 'Memory' list. 
+# Once you add the Google Sheet later, this is where it will live.
+st.divider()
+st.subheader("Financial Overview")
+
+# Display Metrics
+col1, col2 = st.columns(2)
+col1.metric("Revenue (Last 100 Bookings)", f"${total_revenue:,.2f}")
+col2.metric("Target", "$5,000", delta=f"{total_revenue - 5000:,.2f}")
+
+# --- 5. THE EXPENSE FORM ---
+st.divider()
+with st.expander("📝 Add Expense (Rent, Utilities, etc.)"):
+    with st.form("expense_form", clear_on_submit=True):
+        date = st.date_input("Date Paid", datetime.now())
+        category = st.selectbox("Category", ["Rent", "Labor", "Electric", "Gas", "Water", "Insurance", "Marketing"])
+        amount = st.number_input("Amount ($)", min_value=0.0, step=10.0)
+        submitted = st.form_submit_button("Log Expense")
+        
+        if submitted:
+            st.success(f"Logged ${amount} for {category}. (Note: Connect Google Sheets to save this permanently!)")
+
+# --- 6. DATA TABLE ---
+if data:
+    with st.expander("View Recent Bookings"):
+        # Show a clean table of the latest bookings
+        simple_data = []
+        for b in data:
+            simple_data.append({
+                "Date": b.get('startTime', '')[:10],
+                "Customer": b.get('customer', {}).get('firstName', 'N/A'),
+                "Price": f"${b.get('finalPrice', {}).get('amount', '0')}"
+            })
+        st.table(pd.DataFrame(simple_data))
