@@ -23,7 +23,7 @@ EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 with st.sidebar:
     st.title("🔍 Filters")
     
-    # Defaults: Year to Date
+    # Default to Full Year
     today = datetime.now()
     start_of_year = today.replace(month=1, day=1)
     
@@ -40,73 +40,101 @@ with st.sidebar:
          "🚀 Pipeline (Future)", 
          "📉 Cancellation Analysis"]
     )
+    
+    st.divider()
+    show_debug = st.checkbox("Show Sync Log (Debug)", value=False)
+    
     date_label = f"{start_val.strftime('%b %d, %Y')} - {end_val.strftime('%b %d, %Y')}"
 
-# --- 4. DATA ENGINE (SMART CHUNKING) ---
+# --- 4. DATA ENGINE (MICRO-CHUNKING) ---
 @st.cache_data(ttl=900) 
 def fetch_bookeo(start_d, end_d):
     all_bookings = []
+    log_messages = []
     
-    # Convert to datetime for math
+    # Convert to datetime
     current_start = datetime.combine(start_d, datetime.min.time())
     final_end = datetime.combine(end_d, datetime.max.time())
     
     # Progress UI
-    progress_bar = st.progress(0, text="Initializing Smart Sync...")
+    progress_bar = st.progress(0, text="Initializing Bulletproof Sync...")
     total_days = (final_end - current_start).days
     if total_days == 0: total_days = 1
     
-    # --- CHUNKING LOOP ---
-    # We loop through the requested range in 30-day blocks
+    # --- MICRO-CHUNKING LOOP ---
+    # We use 10-DAY CHUNKS. This is small enough to never timeout, but fast enough to finish.
+    CHUNK_SIZE = 10 
+    
     while current_start < final_end:
-        # Define the end of this 30-day chunk
-        chunk_end = current_start + timedelta(days=30)
+        # Define chunk end
+        chunk_end = current_start + timedelta(days=CHUNK_SIZE)
         if chunk_end > final_end:
             chunk_end = final_end
             
-        # UI Update
+        # Update Progress
         days_done = (current_start - datetime.combine(start_d, datetime.min.time())).days
         pct = min(days_done / total_days, 1.0)
-        progress_bar.progress(pct, text=f"Scanning {current_start.strftime('%b %Y')}...")
+        progress_bar.progress(pct, text=f"Syncing: {current_start.strftime('%b %d')} to {chunk_end.strftime('%b %d')}...")
         
-        # Prepare API strings for this chunk
+        # Prepare URL params
         start_str = current_start.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_str = chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ")
         
         page_token = ""
+        chunk_bookings_count = 0
         
-        # --- PAGINATION INNER LOOP ---
-        for _ in range(20): # Safety limit per month (2000 bookings/month)
-            url = (f"https://api.bookeo.com/v2/bookings"
-                   f"?apiKey={API_KEY}"
-                   f"&secretKey={SECRET_KEY}"
-                   f"&startTime={start_str}"
-                   f"&endTime={end_str}"
-                   f"&itemsPerPage=100")
-            
-            if page_token: url += f"&pageNavigationToken={page_token}"
-
+        # --- RETRY LOOP ---
+        # If a chunk fails, we try 3 times before giving up on just that week
+        for attempt in range(3):
             try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    data = response.json()
-                    bookings = data.get('data', [])
-                    all_bookings.extend(bookings)
+                # --- PAGINATION LOOP ---
+                # Retrieve all pages for this 7-day period
+                for _ in range(50): # Max 5000 bookings per week (plenty)
+                    url = (f"https://api.bookeo.com/v2/bookings"
+                           f"?apiKey={API_KEY}"
+                           f"&secretKey={SECRET_KEY}"
+                           f"&startTime={start_str}"
+                           f"&endTime={end_str}"
+                           f"&itemsPerPage=100")
                     
-                    page_token = data.get('info', {}).get('pageNavigationToken')
-                    if not page_token: break
-                    time.sleep(0.1)
-                else:
-                    # If error, break inner loop to try next chunk
-                    break 
-            except:
-                break
+                    if page_token: url += f"&pageNavigationToken={page_token}"
+
+                    response = requests.get(url, timeout=10) # 10s timeout
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        bookings = data.get('data', [])
+                        
+                        if not bookings: 
+                            break # No more data for this chunk
+                        
+                        all_bookings.extend(bookings)
+                        chunk_bookings_count += len(bookings)
+                        
+                        page_token = data.get('info', {}).get('pageNavigationToken')
+                        if not page_token: 
+                            break # End of pagination
+                        
+                        time.sleep(0.1) # Be polite
+                    else:
+                        # API Error (Rate limit or bad request)
+                        log_messages.append(f"⚠️ API Error {response.status_code} at {start_str}")
+                        time.sleep(1) # Backoff
+                        break 
+                
+                # If we got here without exception, the chunk is done successfully
+                log_messages.append(f"✅ {current_start.strftime('%b %d')}: Found {chunk_bookings_count} bookings")
+                break # Break retry loop
+                
+            except Exception as e:
+                log_messages.append(f"❌ Connection Fail at {start_str}: {e}")
+                time.sleep(2) # Wait 2s before retry
         
-        # Advance to next chunk (Move start forward)
+        # Move to next chunk
         current_start = chunk_end + timedelta(seconds=1)
             
     progress_bar.empty()
-    return all_bookings
+    return all_bookings, log_messages
 
 def fetch_expenses():
     default_df = pd.DataFrame(columns=["Date", "Category", "Amount"])
@@ -123,7 +151,7 @@ def fetch_expenses():
         return default_df
 
 # Trigger Fetch
-raw_bookings = fetch_bookeo(start_val, end_val)
+raw_bookings, debug_logs = fetch_bookeo(start_val, end_val)
 raw_expenses = fetch_expenses()
 
 # --- 5. PROCESSING ---
@@ -131,6 +159,7 @@ data_list = []
 if raw_bookings:
     for b in raw_bookings:
         booking_id = b.get('bookingNumber')
+        
         price_info = b.get('price', {})
         total_gross = float(price_info.get('totalGross', {}).get('amount', 0))
         total_paid = float(price_info.get('totalPaid', {}).get('amount', 0))
@@ -166,7 +195,6 @@ if raw_bookings:
 
 df = pd.DataFrame(data_list)
 if not df.empty:
-    # Important: Chunking might create slight overlaps, deduplication fixes it
     df.drop_duplicates(subset=['Booking ID'], inplace=True)
     df.sort_values(by="Event Date", ascending=False, inplace=True)
 
@@ -177,9 +205,17 @@ if not raw_expenses.empty and 'Date' in raw_expenses.columns:
 else:
     filtered_expenses = pd.DataFrame(columns=["Date", "Category", "Amount"])
 
-# --- 6. VIEWS ---
+# --- 6. DASHBOARD ---
 st.title(f"{view_mode}")
 st.caption(f"Range: {date_label}")
+
+if show_debug:
+    with st.expander("🛠️ View Sync Logs (Debug)", expanded=True):
+        for log in debug_logs:
+            if "❌" in log or "⚠️" in log:
+                st.error(log)
+            else:
+                st.write(log)
 
 if df.empty:
     st.warning(f"No bookings found.")
