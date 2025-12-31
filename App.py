@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import time
 from datetime import datetime, timedelta
 
 # --- 1. SETUP ---
@@ -11,24 +12,22 @@ try:
     API_KEY = st.secrets["API_KEY"]
     SECRET_KEY = st.secrets["SECRET_KEY"]
 except:
-    st.error("❌ Secrets missing. Please check your Streamlit settings.")
+    st.error("❌ Secrets missing. Check Streamlit settings.")
     st.stop()
 
-# GOOGLE SHEET CONFIG (Replace with your actual Sheet ID below)
-# Example ID: 1BxiM_9_random_letters_7s
-SHEET_ID = "1f79HfLYphC8X3JHjLNxleia6weOJQr-YMbisLk69Pj4" 
+# --- 2. GOOGLE SHEET CONFIG ---
+# PASTE YOUR ID HERE:
+SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE" 
 
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
 EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
-# --- 2. THE DATA ENGINE ---
-@st.cache_data(ttl=600)
+# --- 3. THE DATA ENGINE ---
+@st.cache_data(ttl=3600) # Remembers data for 1 hour to avoid 429 errors
 def get_bookeo_data():
-    # 1. Look back 30 days
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=30)
     
-    # 2. Format dates for Bookeo
     start_str = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_str = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -36,14 +35,13 @@ def get_bookeo_data():
     has_more_pages = True
     page_token = ""
 
-    # 3. Pagination Loop (Collects ALL data, not just the first 100)
     while has_more_pages:
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
                f"&startTime={start_str}"
                f"&endTime={end_str}"
-               f"&itemsPerPage=100") # Fixed: Changed 300 to 100
+               f"&itemsPerPage=100")
         
         if page_token:
             url += f"&pageNavigationToken={page_token}"
@@ -55,17 +53,18 @@ def get_bookeo_data():
                 bookings = data.get('data', [])
                 all_bookings.extend(bookings)
                 
-                # Check if there is another page of data
-                info = data.get('info', {})
-                page_token = info.get('pageNavigationToken')
-                
+                page_token = data.get('info', {}).get('pageNavigationToken')
                 if not page_token:
                     has_more_pages = False
+                else:
+                    # GENTLE PAUSE: Prevents Error 429
+                    time.sleep(1.5) 
+            elif response.status_code == 429:
+                st.warning("⚠️ Bookeo is busy. Waiting 20 seconds to try again...")
+                time.sleep(20)
             else:
-                st.error(f"⚠️ Bookeo Error {response.status_code}: {response.text}")
                 has_more_pages = False
-        except Exception as e:
-            st.error(f"⚠️ Connection Failed: {e}")
+        except:
             has_more_pages = False
 
     return all_bookings
@@ -73,53 +72,44 @@ def get_bookeo_data():
 def get_expenses():
     try:
         df = pd.read_csv(SHEET_URL)
-        # Clean currency symbols
         if 'Amount' in df.columns:
-            # Force conversion to string first to avoid errors, then replace
             df['Amount'] = df['Amount'].astype(str).str.replace(r'[$,]', '', regex=True)
             df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce').fillna(0.0)
         return df
     except:
         return pd.DataFrame(columns=["Date", "Category", "Amount"])
 
-# --- 3. DASHBOARD DISPLAY ---
+# --- 4. DASHBOARD DISPLAY ---
 st.title("🗝️ Novus Performance")
-st.caption("Data: Last 30 Days")
+st.caption("30-Day View")
 
-with st.spinner('Syncing with Bookeo...'):
+with st.spinner('Updating from Bookeo...'):
     bookings = get_bookeo_data()
     expenses = get_expenses()
 
 # CALCULATIONS
-total_revenue = 0.0
-if bookings:
-    for b in bookings:
-        price_info = b.get('finalPrice', {})
-        # Only count if amount exists
-        if price_info:
-            total_revenue += float(price_info.get('amount', 0))
-
-total_expenses = expenses['Amount'].sum() if not expenses.empty and 'Amount' in expenses.columns else 0
+total_revenue = sum([float(b.get('finalPrice', {}).get('amount', 0)) for b in bookings])
+total_expenses = expenses['Amount'].sum() if not expenses.empty else 0
 net_profit = total_revenue - total_expenses
 
 # METRICS
 col1, col2, col3 = st.columns(3)
 col1.metric("Revenue", f"${total_revenue:,.0f}")
 col2.metric("Expenses", f"${total_expenses:,.0f}")
-col3.metric("Profit", f"${net_profit:,.0f}", delta_color="normal")
+col3.metric("Profit", f"${net_profit:,.0f}")
 
 st.divider()
 
-# TABLE & LINK
-st.link_button("➕ Add Expenses (Google Sheets)", EDIT_LINK)
+# MANAGE EXPENSES
+st.link_button("➕ Open Google Sheets to Add Expenses", EDIT_LINK)
 
-with st.expander(f"View Bookings ({len(bookings)} found)"):
+# RECENT LIST
+with st.expander(f"Recent Games ({len(bookings)})"):
     if bookings:
-        simple_data = []
+        df_list = []
         for b in bookings:
-            simple_data.append({
+            df_list.append({
                 "Date": b.get('startTime', '')[:10],
-                "Customer": b.get('customer', {}).get('firstName', 'Unknown'),
-                "Price": f"${b.get('finalPrice', {}).get('amount', '0')}"
+                "Price": float(b.get('finalPrice', {}).get('amount', 0))
             })
-        st.dataframe(pd.DataFrame(simple_data))
+        st.dataframe(pd.DataFrame(df_list))
