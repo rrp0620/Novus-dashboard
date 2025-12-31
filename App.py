@@ -32,14 +32,13 @@ def get_bookeo_data():
     page_token = ""
     
     for _ in range(5): 
-        # ADDED "&expand=customer,payments" TO FORCE DETAILS
+        # We don't need 'expand' anymore since we found the data in the standard view!
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
                f"&startTime={start_str}"
                f"&endTime={end_str}"
-               f"&itemsPerPage=100"
-               f"&expand=customer,payments") 
+               f"&itemsPerPage=100") 
         
         if page_token:
             url += f"&pageNavigationToken={page_token}"
@@ -72,42 +71,38 @@ def get_expenses():
 st.title("🗝️ Novus Performance")
 st.caption("14-Day View")
 
-with st.spinner(' expanding booking details...'):
+with st.spinner('Syncing...'):
     bookings = get_bookeo_data()
     expenses = get_expenses()
 
-# --- 5. THE RAW INSPECTOR ---
-# This part calculates revenue, but also shows us the RAW data if it fails
+# --- 5. FIXED PARSING LOGIC ---
 total_rev = 0.0
 list_for_table = []
 
 for b in bookings:
-    # Now that we expanded, we look for price in 'totalPrice' or 'payments'
-    val = 0.0
+    # 1. GET PRICE (Fixed based on your data)
+    # Your data format: price -> totalGross -> amount
+    price_data = b.get('price', {})
+    gross = price_data.get('totalGross', {})
     
-    # Check 1: Final Price
-    p1 = b.get('finalPrice', {}).get('amount')
-    if p1: val = float(p1)
-    
-    # Check 2: If finalPrice is missing, check Total Price
-    if val == 0:
-        p2 = b.get('totalPrice', {}).get('amount')
-        if p2: val = float(p2)
+    val_str = gross.get('amount', '0') # This grabs "30"
+    val = float(val_str)
         
     total_rev += val
     
-    # Safe name check
-    name = b.get('customer', {}).get('firstName', '???')
+    # 2. GET NAME (Fixed based on your data)
+    # Your data format: "title": "Courtney Ash"
+    customer_name = b.get('title', 'Unknown')
     
     list_for_table.append({
         "Date": b.get('startTime', '')[:10],
-        "Customer": name,
+        "Customer": customer_name,
         "Amt": val
     })
 
 total_exp = expenses['Amount'].sum() if not expenses.empty else 0
 
-# Metrics
+# Visuals
 c1, c2, c3 = st.columns(3)
 c1.metric("Revenue", f"${total_rev:,.0f}")
 c2.metric("Expenses", f"${total_exp:,.0f}")
@@ -115,15 +110,10 @@ c3.metric("Profit", f"${total_rev - total_exp:,.0f}")
 
 st.divider()
 
-# DEBUGGER: VIEW RAW DATA
-# If you still see 0s, expand this box to see exactly what Bookeo is sending!
-with st.expander("🔍 Click to Inspect Raw Data"):
-    if bookings:
-        st.write("Here is the raw data from the first booking. Look for 'price' or 'amount':")
-        st.json(bookings[0]) # <--- This will show the truth
-        st.write("---")
-        st.dataframe(pd.DataFrame(list_for_table))
-    else:
-        st.write("No bookings found.")
+if bookings:
+    st.subheader("Recent Bookings")
+    st.dataframe(pd.DataFrame(list_for_table))
+else:
+    st.write("No bookings found.")
 
-st.link_button("➕ Manage Expenses", EDIT_LINK)
+st.link_button("➕ Add Expenses", EDIT_LINK)
