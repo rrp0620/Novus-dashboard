@@ -23,7 +23,6 @@ EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 with st.sidebar:
     st.title("🔍 Filters")
     
-    # Defaults
     today = datetime.now()
     start_of_year = today.replace(month=1, day=1)
     
@@ -46,53 +45,47 @@ with st.sidebar:
     
     date_label = f"{start_val.strftime('%b %d, %Y')} - {end_val.strftime('%b %d, %Y')}"
 
-# --- 4. DATA ENGINE (FIXED LOOP) ---
+# --- 4. DATA ENGINE (RATE LIMIT PROOF) ---
 @st.cache_data(ttl=900) 
 def fetch_bookeo(start_d, end_d):
     all_bookings = []
     log_messages = []
     
-    # Precise Datetime objects
     current_start = datetime.combine(start_d, datetime.min.time())
-    # FORCE the end time to be the very last second of the day
     final_end = datetime.combine(end_d, datetime.max.time().replace(microsecond=0))
     
-    # Progress UI
-    progress_bar = st.progress(0, text="Initializing Sync...")
-    
-    # Calculate Total Seconds for accurate progress bar
+    progress_bar = st.progress(0, text="Initializing Smart Sync...")
     total_seconds = (final_end - current_start).total_seconds()
     if total_seconds <= 0: total_seconds = 1
     
-    # --- CHUNKING LOOP ---
-    # 10 Days per chunk
+    # 10-Day Chunks (Safe size)
     CHUNK_DAYS = 10 
     
-    # We use a robust while loop that can't "miss" the last day
     while current_start < final_end:
-        # Define chunk end
         chunk_end = current_start + timedelta(days=CHUNK_DAYS)
-        
-        # CLAMP: If chunk overshoots final date, snap it back
-        if chunk_end > final_end:
-            chunk_end = final_end
+        if chunk_end > final_end: chunk_end = final_end
             
-        # Update Progress
+        # UI Update
         elapsed = (current_start - datetime.combine(start_d, datetime.min.time())).total_seconds()
         pct = min(elapsed / total_seconds, 1.0)
-        progress_bar.progress(pct, text=f"Syncing: {current_start.strftime('%b %d')} to {chunk_end.strftime('%b %d')}...")
+        progress_bar.progress(pct, text=f"Syncing: {current_start.strftime('%b %d')} - {chunk_end.strftime('%b %d')}...")
         
-        # Prepare URL params (UTC)
         start_str = current_start.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_str = chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ")
         
         page_token = ""
         chunk_count = 0
+        chunk_success = False
         
-        # Retry Logic
-        for attempt in range(3):
+        # --- RETRY LOOP WITH BACKOFF ---
+        # We try up to 5 times for each chunk if we hit rate limits
+        for attempt in range(5):
             try:
-                # Pagination
+                # Pagination Inner Loop
+                inner_success = True
+                temp_bookings = [] # Store page results temporarily
+                
+                # Fetch up to 50 pages for this chunk
                 for _ in range(50): 
                     url = (f"https://api.bookeo.com/v2/bookings"
                            f"?apiKey={API_KEY}"
@@ -103,36 +96,48 @@ def fetch_bookeo(start_d, end_d):
                     
                     if page_token: url += f"&pageNavigationToken={page_token}"
 
-                    response = requests.get(url, timeout=10)
+                    response = requests.get(url, timeout=15)
+                    
+                    # === THE 429 FIX ===
+                    if response.status_code == 429:
+                        wait_time = (attempt + 1) * 5 # Wait 5s, then 10s, then 15s...
+                        log_messages.append(f"⚠️ Rate Limit (429) at {start_str}. Pausing {wait_time}s...")
+                        time.sleep(wait_time)
+                        inner_success = False # Fail this attempt, trigger retry
+                        break 
                     
                     if response.status_code == 200:
                         data = response.json()
                         bookings = data.get('data', [])
                         
-                        if not bookings: break
-                        
-                        all_bookings.extend(bookings)
-                        chunk_count += len(bookings)
+                        if bookings:
+                            temp_bookings.extend(bookings)
                         
                         page_token = data.get('info', {}).get('pageNavigationToken')
-                        if not page_token: break
-                        time.sleep(0.1)
+                        if not page_token: break # Done with this chunk
+                        
+                        time.sleep(0.2) # Polite delay between pages
                     else:
-                        log_messages.append(f"⚠️ Error {response.status_code} at {start_str}")
-                        break 
+                        log_messages.append(f"⚠️ Error {response.status_code}. Retrying...")
+                        inner_success = False
+                        time.sleep(2)
+                        break
                 
-                log_messages.append(f"✅ {current_start.strftime('%b %d')}: {chunk_count} bookings")
-                break # Success
+                if inner_success:
+                    all_bookings.extend(temp_bookings)
+                    chunk_count = len(temp_bookings)
+                    log_messages.append(f"✅ {current_start.strftime('%b %d')}: {chunk_count} bookings")
+                    chunk_success = True
+                    break # Break the Retry Loop (Success!)
                 
             except Exception as e:
-                log_messages.append(f"❌ Retry {attempt+1} at {start_str}")
-                time.sleep(1)
+                log_messages.append(f"❌ Connection Error: {e}")
+                time.sleep(2)
         
-        # CRITICAL: If we reached the final end, break explicitly
-        if chunk_end == final_end:
-            break
-            
-        # Move start to exactly 1 second after previous end
+        if not chunk_success:
+             log_messages.append(f"❌ FAILED chunk {start_str} after 5 attempts.")
+
+        if chunk_end == final_end: break
         current_start = chunk_end + timedelta(seconds=1)
             
     progress_bar.empty()
@@ -213,7 +218,8 @@ st.caption(f"Range: {date_label}")
 if show_debug:
     with st.expander("🛠️ View Sync Logs (Debug)", expanded=True):
         for log in debug_logs:
-            if "❌" in log or "⚠️" in log: st.error(log)
+            if "❌" in log: st.error(log)
+            elif "⚠️" in log: st.warning(log)
             else: st.write(log)
 
 if df.empty:
