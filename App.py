@@ -45,7 +45,7 @@ def fetch_bookeo(start_d, end_d):
     all_bookings = []
     page_token = ""
     
-    for _ in range(15): # Deep scan (1500 bookings max)
+    for _ in range(15): 
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
@@ -71,15 +71,32 @@ def fetch_bookeo(start_d, end_d):
     return all_bookings
 
 def fetch_expenses():
+    """Robust expense fetcher that never fails on missing columns"""
+    default_df = pd.DataFrame(columns=["Date", "Category", "Amount"])
     try:
         df = pd.read_csv(SHEET_URL)
-        if 'Amount' in df.columns:
-            df['Amount'] = pd.to_numeric(df['Amount'].astype(str).str.replace(r'[$,]', '', regex=True), errors='coerce').fillna(0)
+        
+        # 1. Normalize Header Names (Strip spaces)
+        df.columns = df.columns.str.strip()
+        
+        # 2. Ensure 'Amount' exists
+        if 'Amount' not in df.columns:
+            # Check if user typed 'amount' (lowercase) by mistake
+            if 'amount' in df.columns:
+                df.rename(columns={'amount': 'Amount'}, inplace=True)
+            else:
+                return default_df # Return empty if column is totally missing
+
+        # 3. Clean 'Amount' Data
+        df['Amount'] = pd.to_numeric(df['Amount'].astype(str).str.replace(r'[$,]', '', regex=True), errors='coerce').fillna(0)
+        
+        # 4. Clean 'Date' Data
         if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'])
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            
         return df
     except:
-        return pd.DataFrame(columns=["Date", "Category", "Amount"])
+        return default_df
 
 with st.spinner(f'Processing Financials for {date_label}...'):
     raw_bookings = fetch_bookeo(start_val, end_val)
@@ -90,12 +107,10 @@ data_list = []
 
 if raw_bookings:
     for b in raw_bookings:
-        # 1. Money Logic
         price_info = b.get('price', {})
         total_gross = float(price_info.get('totalGross', {}).get('amount', 0))
         total_paid = float(price_info.get('totalPaid', {}).get('amount', 0))
         
-        # 2. Status Logic
         is_canceled = b.get('canceled', False)
         
         if is_canceled:
@@ -107,12 +122,10 @@ if raw_bookings:
         else:
             status = "Unpaid"
 
-        # 3. Dates
         created = pd.to_datetime(b.get('creationTime', '')[:10])
         event = pd.to_datetime(b.get('startTime', '')[:10])
         lead_time = (event - created).days
 
-        # 4. Room & People
         room_name = b.get('productName', 'Unknown')
         part_list = b.get('participants', {}).get('numbers', [])
         count = sum([p.get('number', 0) for p in part_list])
@@ -132,30 +145,31 @@ if raw_bookings:
 
 df = pd.DataFrame(data_list)
 
-# Expense Filter
-if not raw_expenses.empty:
+# --- CRITICAL FIX FOR EXPENSE FILTERING ---
+# We force filtered_expenses to always have an 'Amount' column, even if empty
+if not raw_expenses.empty and 'Date' in raw_expenses.columns:
     mask = (raw_expenses['Date'] >= pd.to_datetime(start_val)) & (raw_expenses['Date'] <= pd.to_datetime(end_val))
     filtered_expenses = raw_expenses.loc[mask]
 else:
-    filtered_expenses = pd.DataFrame()
+    # This was the line causing the error! Now fixed:
+    filtered_expenses = pd.DataFrame(columns=["Date", "Category", "Amount"])
 
 # --- 6. DASHBOARD VIEWS ---
 st.title(f"{view_mode}")
 st.caption(f"Range: {date_label}")
 
 if df.empty:
-    st.warning("No data found.")
-    st.stop()
+    st.warning("No Bookeo data found for this period.")
+    # We don't stop here, we still show expenses if available
 
 # === VIEW 1: REVENUE (Real Money Only) ===
 if view_mode == "💰 Revenue & Profit":
-    # Filter: Only count realized revenue (Paid + Partial portions)
-    # We EXCLUDE "Cancelled" completely from this view
-    active_df = df[df['Status'] != "Cancelled"]
+    active_df = df[df['Status'] != "Cancelled"] if not df.empty else df
     
-    # Revenue = Actual money collected (Paid Amount), NOT Total Price
-    real_revenue = active_df['Paid Amount'].sum()
-    total_exp = filtered_expenses['Amount'].sum()
+    real_revenue = active_df['Paid Amount'].sum() if not active_df.empty else 0
+    
+    # Safe sum (will be 0 if empty)
+    total_exp = filtered_expenses['Amount'].sum() if not filtered_expenses.empty else 0
     net_profit = real_revenue - total_exp
     
     m1, m2, m3 = st.columns(3)
@@ -165,18 +179,22 @@ if view_mode == "💰 Revenue & Profit":
 
     st.divider()
     
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Revenue by Room")
-        st.bar_chart(active_df.groupby("Room")["Paid Amount"].sum(), color="#00CC96")
-    with c2:
-        st.subheader("Revenue by Day")
-        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        st.bar_chart(active_df.groupby("Day")["Paid Amount"].sum().reindex(day_order), color="#636EFA")
+    if not active_df.empty:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Revenue by Room")
+            st.bar_chart(active_df.groupby("Room")["Paid Amount"].sum(), color="#00CC96")
+        with c2:
+            st.subheader("Revenue by Day")
+            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            st.bar_chart(active_df.groupby("Day")["Paid Amount"].sum().reindex(day_order), color="#636EFA")
 
-# === VIEW 2: PIPELINE (The "Gap") ===
+# === VIEW 2: PIPELINE ===
 elif view_mode == "🚀 Pipeline (Future)":
-    # Filter: Partially Paid or Unpaid (but NOT cancelled)
+    if df.empty:
+        st.info("No data.")
+        st.stop()
+        
     pipeline_df = df[(df['Status'].isin(["Partially Paid", "Unpaid"])) & (df['Status'] != "Cancelled")]
     
     pending_collection = pipeline_df['Outstanding'].sum()
@@ -197,15 +215,18 @@ elif view_mode == "🚀 Pipeline (Future)":
         hide_index=True
     )
 
-# === VIEW 3: CANCELLATION INTELLIGENCE ===
+# === VIEW 3: CANCELLATION ANALYSIS ===
 elif view_mode == "📉 Cancellation Analysis":
+    if df.empty:
+        st.info("No data.")
+        st.stop()
+
     cancel_df = df[df['Status'] == "Cancelled"]
     total_bookings = len(df)
     cancel_count = len(cancel_df)
     cancel_rate = (cancel_count / total_bookings * 100) if total_bookings > 0 else 0
     lost_revenue = cancel_df['Total Price'].sum()
     
-    # Insights
     avg_lead_cancel = cancel_df['Lead Days'].mean() if not cancel_df.empty else 0
     avg_lead_all = df['Lead Days'].mean()
     
@@ -214,23 +235,24 @@ elif view_mode == "📉 Cancellation Analysis":
     m1, m2, m3 = st.columns(3)
     m1.metric("Cancellation Rate", f"{cancel_rate:.1f}%")
     m2.metric("Lost Bookings", cancel_count)
-    m3.metric("Avg Lead Time (Cancelled)", f"{avg_lead_cancel:.1f} days", help="How many days in advance cancelled bookings were made.")
+    m3.metric("Avg Lead Time (Cancelled)", f"{avg_lead_cancel:.1f} days")
     
     st.divider()
     
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Which Room gets cancelled most?")
-        st.bar_chart(cancel_df['Room'].value_counts(), color="#EF553B")
+        if not cancel_df.empty:
+            st.bar_chart(cancel_df['Room'].value_counts(), color="#EF553B")
         
     with c2:
         st.subheader("Lead Time Analysis")
         st.write(f"Average Booking Lead Time: **{avg_lead_all:.1f} days**")
         st.write(f"Average Cancelled Lead Time: **{avg_lead_cancel:.1f} days**")
         if avg_lead_cancel < 2:
-            st.warning("⚠️ **Insight:** People are cancelling last-minute bookings. Consider a stricter deposit policy for bookings made <48h out.")
+            st.warning("⚠️ **Insight:** People are cancelling last-minute bookings.")
         elif avg_lead_cancel > 14:
-            st.warning("⚠️ **Insight:** People booking far in advance are cancelling. Send them a reminder email 1 week before to re-confirm.")
+            st.warning("⚠️ **Insight:** People booking far in advance are cancelling.")
             
     st.subheader("Recent Cancellations")
     st.dataframe(cancel_df[["Event Date", "Customer", "Room", "Lead Days", "Total Price"]], use_container_width=True)
