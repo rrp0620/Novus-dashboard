@@ -16,7 +16,7 @@ except:
     st.stop()
 
 # --- 2. CONFIG ---
-SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE" # <--- Ensure this is correct!
+SHEET_ID = "1f79HfLYphC8X3JHjLNxleia6weOJQr-YMbisLk69Pj4" # <--- Ensure this is correct!
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
 
 # --- 3. FAST DATA ENGINE ---
