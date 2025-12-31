@@ -12,7 +12,7 @@ try:
     API_KEY = st.secrets["API_KEY"]
     SECRET_KEY = st.secrets["SECRET_KEY"]
 except:
-    st.error("❌ Secrets missing in Streamlit Settings.")
+    st.error("❌ Secrets missing.")
     st.stop()
 
 # --- 2. CONFIG ---
@@ -32,12 +32,14 @@ def get_bookeo_data():
     page_token = ""
     
     for _ in range(5): 
+        # ADDED "&expand=customer,payments" TO FORCE DETAILS
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
                f"&startTime={start_str}"
                f"&endTime={end_str}"
-               f"&itemsPerPage=100")
+               f"&itemsPerPage=100"
+               f"&expand=customer,payments") 
         
         if page_token:
             url += f"&pageNavigationToken={page_token}"
@@ -70,55 +72,58 @@ def get_expenses():
 st.title("🗝️ Novus Performance")
 st.caption("14-Day View")
 
-with st.spinner('Deep Scanning Bookeo...'):
+with st.spinner(' expanding booking details...'):
     bookings = get_bookeo_data()
     expenses = get_expenses()
 
-# --- 5. THE DEEP SCAN PRICE LOGIC ---
+# --- 5. THE RAW INSPECTOR ---
+# This part calculates revenue, but also shows us the RAW data if it fails
 total_rev = 0.0
 list_for_table = []
 
 for b in bookings:
-    # TRY 5 DIFFERENT WAYS TO FIND THE PRICE
-    # 1. Final Price (Standard)
+    # Now that we expanded, we look for price in 'totalPrice' or 'payments'
+    val = 0.0
+    
+    # Check 1: Final Price
     p1 = b.get('finalPrice', {}).get('amount')
-    # 2. Total Price
-    p2 = b.get('totalPrice', {}).get('amount')
-    # 3. Price received so far
-    p3 = b.get('receivedAmount', {}).get('amount')
-    # 4. Standard Price
-    p4 = b.get('price', {}).get('amount')
-    # 5. Look for a list of payments
-    p5 = 0
-    payments = b.get('payments', [])
-    if payments:
-        p5 = sum([float(p.get('amount', {}).get('amount', 0)) for p in payments])
-
-    # Pick the first one that isn't None
-    val = float(p1 or p2 or p3 or p4 or p5 or 0)
+    if p1: val = float(p1)
+    
+    # Check 2: If finalPrice is missing, check Total Price
+    if val == 0:
+        p2 = b.get('totalPrice', {}).get('amount')
+        if p2: val = float(p2)
         
     total_rev += val
+    
+    # Safe name check
+    name = b.get('customer', {}).get('firstName', '???')
+    
     list_for_table.append({
         "Date": b.get('startTime', '')[:10],
-        "Customer": b.get('customer', {}).get('firstName', '???'),
+        "Customer": name,
         "Amt": val
     })
 
 total_exp = expenses['Amount'].sum() if not expenses.empty else 0
 
-# Visuals
+# Metrics
 c1, c2, c3 = st.columns(3)
-c1.metric("Revenue (14d)", f"${total_rev:,.0f}")
+c1.metric("Revenue", f"${total_rev:,.0f}")
 c2.metric("Expenses", f"${total_exp:,.0f}")
-c3.metric("Net Profit", f"${total_rev - total_exp:,.0f}")
+c3.metric("Profit", f"${total_rev - total_exp:,.0f}")
 
 st.divider()
 
-# List for verification
-if bookings:
-    st.subheader("Booking Audit")
-    st.dataframe(pd.DataFrame(list_for_table))
-else:
-    st.write("No data found in Bookeo for the last 14 days.")
+# DEBUGGER: VIEW RAW DATA
+# If you still see 0s, expand this box to see exactly what Bookeo is sending!
+with st.expander("🔍 Click to Inspect Raw Data"):
+    if bookings:
+        st.write("Here is the raw data from the first booking. Look for 'price' or 'amount':")
+        st.json(bookings[0]) # <--- This will show the truth
+        st.write("---")
+        st.dataframe(pd.DataFrame(list_for_table))
+    else:
+        st.write("No bookings found.")
 
 st.link_button("➕ Manage Expenses", EDIT_LINK)
