@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Novus Dashboard", page_icon="🗝️")
+st.set_page_config(page_title="Novus Dashboard", page_icon="🗝️", layout="wide") # Layout="wide" for better table view
 
 # Retrieve Keys
 try:
@@ -32,13 +32,14 @@ def get_bookeo_data():
     page_token = ""
     
     for _ in range(5): 
-        # We don't need 'expand' anymore since we found the data in the standard view!
+        # Added &expand=customer to get Email and City/State
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
                f"&startTime={start_str}"
                f"&endTime={end_str}"
-               f"&itemsPerPage=100") 
+               f"&itemsPerPage=100"
+               f"&expand=customer") 
         
         if page_token:
             url += f"&pageNavigationToken={page_token}"
@@ -71,38 +72,66 @@ def get_expenses():
 st.title("🗝️ Novus Performance")
 st.caption("14-Day View")
 
-with st.spinner('Syncing...'):
+with st.spinner('Compiling data...'):
     bookings = get_bookeo_data()
     expenses = get_expenses()
 
-# --- 5. FIXED PARSING LOGIC ---
+# --- 5. DATA EXTRACTION & SORTING ---
+table_data = []
 total_rev = 0.0
-list_for_table = []
 
 for b in bookings:
-    # 1. GET PRICE (Fixed based on your data)
-    # Your data format: price -> totalGross -> amount
-    price_data = b.get('price', {})
-    gross = price_data.get('totalGross', {})
-    
-    val_str = gross.get('amount', '0') # This grabs "30"
-    val = float(val_str)
-        
+    # 1. PRICE
+    gross = b.get('price', {}).get('totalGross', {})
+    val = float(gross.get('amount', 0))
     total_rev += val
     
-    # 2. GET NAME (Fixed based on your data)
-    # Your data format: "title": "Courtney Ash"
-    customer_name = b.get('title', 'Unknown')
+    # 2. PARTICIPANTS (Sum up the list)
+    # Data looks like: participants -> numbers -> [{number: 2}, {number: 1}]
+    part_list = b.get('participants', {}).get('numbers', [])
+    count = sum([p.get('number', 0) for p in part_list])
+
+    # 3. CUSTOMER DETAILS (From the 'customer' expansion)
+    cust = b.get('customer', {})
+    # If expansion fails, fallback to basic fields
+    email = cust.get('emailAddress', 'N/A')
     
-    list_for_table.append({
-        "Date": b.get('startTime', '')[:10],
-        "Customer": customer_name,
-        "Amt": val
+    address = cust.get('streetAddress', {})
+    city = address.get('city', '')
+    state = address.get('state', '')
+    location = f"{city}, {state}".strip(", ")
+    
+    if not location: location = "N/A"
+
+    # 4. DATES (Cleanup formatting)
+    created_raw = b.get('creationTime', '')[:10] # YYYY-MM-DD
+    event_raw = b.get('startTime', '')[:10]      # YYYY-MM-DD
+
+    table_data.append({
+        "Booking Created": created_raw,
+        "Event Date": event_raw,
+        "Customer Name": b.get('title', 'Unknown'),
+        "Email": email,
+        "Participants": count,
+        "Amount": val, # Keep as number for sorting, format later
+        "Location": location
     })
 
-total_exp = expenses['Amount'].sum() if not expenses.empty else 0
+# Convert to DataFrame
+df = pd.DataFrame(table_data)
 
-# Visuals
+# SORTING: Sort by 'Event Date' (Newest first)
+if not df.empty:
+    df['Event Date'] = pd.to_datetime(df['Event Date'])
+    df = df.sort_values(by='Event Date', ascending=False)
+    # Convert back to string for clean display
+    df['Event Date'] = df['Event Date'].dt.strftime('%Y-%m-%d')
+    
+    # FORMATTING THE DOLLAR SIGN
+    df['Amount'] = df['Amount'].apply(lambda x: f"${x:,.2f}")
+
+# --- 6. DISPLAY ---
+total_exp = expenses['Amount'].sum() if not expenses.empty else 0
 c1, c2, c3 = st.columns(3)
 c1.metric("Revenue", f"${total_rev:,.0f}")
 c2.metric("Expenses", f"${total_exp:,.0f}")
@@ -110,10 +139,14 @@ c3.metric("Profit", f"${total_rev - total_exp:,.0f}")
 
 st.divider()
 
-if bookings:
+if not df.empty:
     st.subheader("Recent Bookings")
-    st.dataframe(pd.DataFrame(list_for_table))
+    st.dataframe(
+        df, 
+        hide_index=True,
+        column_order=("Event Date", "Booking Created", "Customer Name", "Email", "Participants", "Amount", "Location")
+    )
 else:
-    st.write("No bookings found.")
+    st.info("No bookings found in the last 14 days.")
 
-st.link_button("➕ Add Expenses", EDIT_LINK)
+st.link_button("➕ Manage Expenses", EDIT_LINK)
