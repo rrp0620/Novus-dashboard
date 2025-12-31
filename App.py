@@ -15,13 +15,13 @@ except:
     st.error("❌ Secrets missing in Streamlit Settings.")
     st.stop()
 
-# --- 2. CONFIG (Your Sheet ID is now included!) ---
+# --- 2. CONFIG ---
 SHEET_ID = "1f79HfLYphC8X3JHjLNxleia6weOJQr-YMbisLk69Pj4" 
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
 EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
 # --- 3. DATA ENGINE ---
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600)
 def get_bookeo_data():
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=14)
@@ -31,7 +31,7 @@ def get_bookeo_data():
     all_bookings = []
     page_token = ""
     
-    for _ in range(5): # Up to 500 bookings
+    for _ in range(5): 
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
@@ -70,27 +70,37 @@ def get_expenses():
 st.title("🗝️ Novus Performance")
 st.caption("14-Day View")
 
-with st.spinner('Syncing...'):
+with st.spinner('Deep Scanning Bookeo...'):
     bookings = get_bookeo_data()
     expenses = get_expenses()
 
-# --- 5. PRICE CALCULATION LOGIC ---
+# --- 5. THE DEEP SCAN PRICE LOGIC ---
 total_rev = 0.0
 list_for_table = []
 
 for b in bookings:
-    # We check multiple places for the price (Bookeo varies by account type)
-    price_obj = b.get('finalPrice') or b.get('totalPrice') or b.get('price')
-    
-    val = 0.0
-    if isinstance(price_obj, dict):
-        val = float(price_obj.get('amount', 0))
-    elif isinstance(price_obj, (int, float)):
-        val = float(price_obj)
+    # TRY 5 DIFFERENT WAYS TO FIND THE PRICE
+    # 1. Final Price (Standard)
+    p1 = b.get('finalPrice', {}).get('amount')
+    # 2. Total Price
+    p2 = b.get('totalPrice', {}).get('amount')
+    # 3. Price received so far
+    p3 = b.get('receivedAmount', {}).get('amount')
+    # 4. Standard Price
+    p4 = b.get('price', {}).get('amount')
+    # 5. Look for a list of payments
+    p5 = 0
+    payments = b.get('payments', [])
+    if payments:
+        p5 = sum([float(p.get('amount', {}).get('amount', 0)) for p in payments])
+
+    # Pick the first one that isn't None
+    val = float(p1 or p2 or p3 or p4 or p5 or 0)
         
     total_rev += val
     list_for_table.append({
         "Date": b.get('startTime', '')[:10],
+        "Customer": b.get('customer', {}).get('firstName', '???'),
         "Amt": val
     })
 
@@ -103,11 +113,12 @@ c2.metric("Expenses", f"${total_exp:,.0f}")
 c3.metric("Net Profit", f"${total_rev - total_exp:,.0f}")
 
 st.divider()
-st.link_button("➕ Manage Expenses (Google Sheets)", EDIT_LINK)
 
-if not expenses.empty:
-    st.subheader("Spending by Category")
-    st.bar_chart(expenses.groupby("Category")["Amount"].sum())
-
-with st.expander("View Booking History"):
+# List for verification
+if bookings:
+    st.subheader("Booking Audit")
     st.dataframe(pd.DataFrame(list_for_table))
+else:
+    st.write("No data found in Bookeo for the last 14 days.")
+
+st.link_button("➕ Manage Expenses", EDIT_LINK)
