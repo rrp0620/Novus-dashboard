@@ -58,14 +58,12 @@ def fetch_bookeo(start_d, end_d):
     total_seconds = (final_end - current_start).total_seconds()
     if total_seconds <= 0: total_seconds = 1
     
-    # 10-Day Chunks (Safe size)
     CHUNK_DAYS = 10 
     
     while current_start < final_end:
         chunk_end = current_start + timedelta(days=CHUNK_DAYS)
         if chunk_end > final_end: chunk_end = final_end
             
-        # UI Update
         elapsed = (current_start - datetime.combine(start_d, datetime.min.time())).total_seconds()
         pct = min(elapsed / total_seconds, 1.0)
         progress_bar.progress(pct, text=f"Syncing: {current_start.strftime('%b %d')} - {chunk_end.strftime('%b %d')}...")
@@ -77,15 +75,11 @@ def fetch_bookeo(start_d, end_d):
         chunk_count = 0
         chunk_success = False
         
-        # --- RETRY LOOP WITH BACKOFF ---
-        # We try up to 5 times for each chunk if we hit rate limits
         for attempt in range(5):
             try:
-                # Pagination Inner Loop
                 inner_success = True
-                temp_bookings = [] # Store page results temporarily
+                temp_bookings = [] 
                 
-                # Fetch up to 50 pages for this chunk
                 for _ in range(50): 
                     url = (f"https://api.bookeo.com/v2/bookings"
                            f"?apiKey={API_KEY}"
@@ -98,25 +92,22 @@ def fetch_bookeo(start_d, end_d):
 
                     response = requests.get(url, timeout=15)
                     
-                    # === THE 429 FIX ===
                     if response.status_code == 429:
-                        wait_time = (attempt + 1) * 5 # Wait 5s, then 10s, then 15s...
+                        wait_time = (attempt + 1) * 5 
                         log_messages.append(f"⚠️ Rate Limit (429) at {start_str}. Pausing {wait_time}s...")
                         time.sleep(wait_time)
-                        inner_success = False # Fail this attempt, trigger retry
+                        inner_success = False 
                         break 
                     
                     if response.status_code == 200:
                         data = response.json()
                         bookings = data.get('data', [])
                         
-                        if bookings:
-                            temp_bookings.extend(bookings)
+                        if bookings: temp_bookings.extend(bookings)
                         
                         page_token = data.get('info', {}).get('pageNavigationToken')
-                        if not page_token: break # Done with this chunk
-                        
-                        time.sleep(0.2) # Polite delay between pages
+                        if not page_token: break 
+                        time.sleep(0.2) 
                     else:
                         log_messages.append(f"⚠️ Error {response.status_code}. Retrying...")
                         inner_success = False
@@ -128,7 +119,7 @@ def fetch_bookeo(start_d, end_d):
                     chunk_count = len(temp_bookings)
                     log_messages.append(f"✅ {current_start.strftime('%b %d')}: {chunk_count} bookings")
                     chunk_success = True
-                    break # Break the Retry Loop (Success!)
+                    break 
                 
             except Exception as e:
                 log_messages.append(f"❌ Connection Error: {e}")
@@ -161,7 +152,7 @@ def fetch_expenses():
 raw_bookings, debug_logs = fetch_bookeo(start_val, end_val)
 raw_expenses = fetch_expenses()
 
-# --- 5. PROCESSING ---
+# --- 5. PROCESSING (UPDATED FOR TIME ANALYSIS) ---
 data_list = []
 if raw_bookings:
     for b in raw_bookings:
@@ -176,9 +167,16 @@ if raw_bookings:
         elif total_paid > 0: status = "Partially Paid"
         else: status = "Unpaid"
 
-        created = pd.to_datetime(b.get('creationTime', '')[:10])
-        event = pd.to_datetime(b.get('startTime', '')[:10])
-        lead_time = (event - created).days
+        # --- NEW: Extract Time of Day ---
+        full_dt = pd.to_datetime(b.get('startTime', ''))
+        event_date = full_dt.date()
+        created = pd.to_datetime(b.get('creationTime', ''))
+        lead_time = (full_dt - created).days
+
+        # Format Hour (e.g., "14" -> "02 PM")
+        # We store the integer for sorting, string for display
+        hour_int = full_dt.hour
+        hour_str = full_dt.strftime("%I %p") # "02 PM"
 
         room_name = b.get('productName', 'Unknown')
         part_list = b.get('participants', {}).get('numbers', [])
@@ -186,7 +184,7 @@ if raw_bookings:
 
         data_list.append({
             "Booking ID": booking_id,
-            "Event Date": event,
+            "Event Date": pd.to_datetime(event_date),
             "Room": room_name,
             "Total Price": total_gross,
             "Paid Amount": total_paid,
@@ -195,8 +193,10 @@ if raw_bookings:
             "Participants": count,
             "Lead Days": lead_time,
             "Customer": b.get('title', 'Unknown'),
-            "Day": event.strftime("%A"),
-            "Month": event.strftime("%Y-%m")
+            "Day": full_dt.strftime("%A"),
+            "Month": full_dt.strftime("%Y-%m"),
+            "Hour Int": hour_int,   # Used for sorting chart
+            "Hour Label": hour_str  # Used for displaying chart
         })
 
 df = pd.DataFrame(data_list)
@@ -204,7 +204,6 @@ if not df.empty:
     df.drop_duplicates(subset=['Booking ID'], inplace=True)
     df.sort_values(by="Event Date", ascending=False, inplace=True)
 
-# Expense Filter
 if not raw_expenses.empty and 'Date' in raw_expenses.columns:
     mask = (raw_expenses['Date'] >= pd.to_datetime(start_val)) & (raw_expenses['Date'] <= pd.to_datetime(end_val))
     filtered_expenses = raw_expenses.loc[mask]
@@ -226,7 +225,7 @@ if df.empty:
     st.warning(f"No bookings found.")
     st.stop()
 
-# === VIEW 1: REVENUE & PROFIT ===
+# === VIEW 1: REVENUE & PROFIT (WITH TIME ANALYSIS) ===
 if view_mode == "💰 Revenue & Profit":
     active_df = df[df['Status'] != "Cancelled"]
     real_revenue = active_df['Paid Amount'].sum() if not active_df.empty else 0
@@ -239,19 +238,34 @@ if view_mode == "💰 Revenue & Profit":
     m3.metric("Net Profit", f"${net_profit:,.0f}")
     
     with st.expander("🔎 Inspect Revenue Source"):
-        insp_df = active_df[['Event Date', 'Customer', 'Room', 'Paid Amount']].copy()
+        insp_df = active_df[['Event Date', 'Hour Label', 'Customer', 'Room', 'Paid Amount']].copy()
         insp_df['Event Date'] = insp_df['Event Date'].dt.strftime('%Y-%m-%d')
         insp_df['Paid Amount'] = insp_df['Paid Amount'].apply(lambda x: f"${x:,.2f}")
         st.dataframe(insp_df, use_container_width=True, hide_index=True)
 
     st.divider()
+    
     if not active_df.empty:
+        # Row 1: Room & Day
         c1, c2 = st.columns(2)
         c1.subheader("Revenue by Room")
         c1.bar_chart(active_df.groupby("Room")["Paid Amount"].sum(), color="#00CC96")
+        
         c2.subheader("Revenue by Day")
         day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         c2.bar_chart(active_df.groupby("Day")["Paid Amount"].sum().reindex(day_order), color="#636EFA")
+        
+        # Row 2: TIME OF DAY ANALYSIS (NEW)
+        st.divider()
+        st.subheader("🕒 Busiest Times of Day")
+        st.caption("When are we making the most money? (Aggregated by Start Hour)")
+        
+        # Group by Hour Integer to ensure 1pm comes after 12pm
+        time_data = active_df.groupby(["Hour Int", "Hour Label"])["Paid Amount"].sum().reset_index()
+        time_data.sort_values("Hour Int", inplace=True)
+        
+        # Display Chart
+        st.bar_chart(time_data.set_index("Hour Label")["Paid Amount"], color="#FFA15A")
 
 # === VIEW 2: TRENDS ===
 elif view_mode == "📈 Business Trends (MoM)":
