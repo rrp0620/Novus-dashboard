@@ -23,7 +23,7 @@ EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 with st.sidebar:
     st.title("🔍 Filters")
     
-    # Default to Full Year
+    # Defaults
     today = datetime.now()
     start_of_year = today.replace(month=1, day=1)
     
@@ -46,50 +46,54 @@ with st.sidebar:
     
     date_label = f"{start_val.strftime('%b %d, %Y')} - {end_val.strftime('%b %d, %Y')}"
 
-# --- 4. DATA ENGINE (MICRO-CHUNKING) ---
+# --- 4. DATA ENGINE (FIXED LOOP) ---
 @st.cache_data(ttl=900) 
 def fetch_bookeo(start_d, end_d):
     all_bookings = []
     log_messages = []
     
-    # Convert to datetime
+    # Precise Datetime objects
     current_start = datetime.combine(start_d, datetime.min.time())
-    final_end = datetime.combine(end_d, datetime.max.time())
+    # FORCE the end time to be the very last second of the day
+    final_end = datetime.combine(end_d, datetime.max.time().replace(microsecond=0))
     
     # Progress UI
-    progress_bar = st.progress(0, text="Initializing Bulletproof Sync...")
-    total_days = (final_end - current_start).days
-    if total_days == 0: total_days = 1
+    progress_bar = st.progress(0, text="Initializing Sync...")
     
-    # --- MICRO-CHUNKING LOOP ---
-    # We use 10-DAY CHUNKS. This is small enough to never timeout, but fast enough to finish.
-    CHUNK_SIZE = 10 
+    # Calculate Total Seconds for accurate progress bar
+    total_seconds = (final_end - current_start).total_seconds()
+    if total_seconds <= 0: total_seconds = 1
     
+    # --- CHUNKING LOOP ---
+    # 10 Days per chunk
+    CHUNK_DAYS = 10 
+    
+    # We use a robust while loop that can't "miss" the last day
     while current_start < final_end:
         # Define chunk end
-        chunk_end = current_start + timedelta(days=CHUNK_SIZE)
+        chunk_end = current_start + timedelta(days=CHUNK_DAYS)
+        
+        # CLAMP: If chunk overshoots final date, snap it back
         if chunk_end > final_end:
             chunk_end = final_end
             
         # Update Progress
-        days_done = (current_start - datetime.combine(start_d, datetime.min.time())).days
-        pct = min(days_done / total_days, 1.0)
+        elapsed = (current_start - datetime.combine(start_d, datetime.min.time())).total_seconds()
+        pct = min(elapsed / total_seconds, 1.0)
         progress_bar.progress(pct, text=f"Syncing: {current_start.strftime('%b %d')} to {chunk_end.strftime('%b %d')}...")
         
-        # Prepare URL params
+        # Prepare URL params (UTC)
         start_str = current_start.strftime("%Y-%m-%dT%H:%M:%SZ")
         end_str = chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ")
         
         page_token = ""
-        chunk_bookings_count = 0
+        chunk_count = 0
         
-        # --- RETRY LOOP ---
-        # If a chunk fails, we try 3 times before giving up on just that week
+        # Retry Logic
         for attempt in range(3):
             try:
-                # --- PAGINATION LOOP ---
-                # Retrieve all pages for this 7-day period
-                for _ in range(50): # Max 5000 bookings per week (plenty)
+                # Pagination
+                for _ in range(50): 
                     url = (f"https://api.bookeo.com/v2/bookings"
                            f"?apiKey={API_KEY}"
                            f"&secretKey={SECRET_KEY}"
@@ -99,38 +103,36 @@ def fetch_bookeo(start_d, end_d):
                     
                     if page_token: url += f"&pageNavigationToken={page_token}"
 
-                    response = requests.get(url, timeout=10) # 10s timeout
+                    response = requests.get(url, timeout=10)
                     
                     if response.status_code == 200:
                         data = response.json()
                         bookings = data.get('data', [])
                         
-                        if not bookings: 
-                            break # No more data for this chunk
+                        if not bookings: break
                         
                         all_bookings.extend(bookings)
-                        chunk_bookings_count += len(bookings)
+                        chunk_count += len(bookings)
                         
                         page_token = data.get('info', {}).get('pageNavigationToken')
-                        if not page_token: 
-                            break # End of pagination
-                        
-                        time.sleep(0.1) # Be polite
+                        if not page_token: break
+                        time.sleep(0.1)
                     else:
-                        # API Error (Rate limit or bad request)
-                        log_messages.append(f"⚠️ API Error {response.status_code} at {start_str}")
-                        time.sleep(1) # Backoff
+                        log_messages.append(f"⚠️ Error {response.status_code} at {start_str}")
                         break 
                 
-                # If we got here without exception, the chunk is done successfully
-                log_messages.append(f"✅ {current_start.strftime('%b %d')}: Found {chunk_bookings_count} bookings")
-                break # Break retry loop
+                log_messages.append(f"✅ {current_start.strftime('%b %d')}: {chunk_count} bookings")
+                break # Success
                 
             except Exception as e:
-                log_messages.append(f"❌ Connection Fail at {start_str}: {e}")
-                time.sleep(2) # Wait 2s before retry
+                log_messages.append(f"❌ Retry {attempt+1} at {start_str}")
+                time.sleep(1)
         
-        # Move to next chunk
+        # CRITICAL: If we reached the final end, break explicitly
+        if chunk_end == final_end:
+            break
+            
+        # Move start to exactly 1 second after previous end
         current_start = chunk_end + timedelta(seconds=1)
             
     progress_bar.empty()
@@ -159,7 +161,6 @@ data_list = []
 if raw_bookings:
     for b in raw_bookings:
         booking_id = b.get('bookingNumber')
-        
         price_info = b.get('price', {})
         total_gross = float(price_info.get('totalGross', {}).get('amount', 0))
         total_paid = float(price_info.get('totalPaid', {}).get('amount', 0))
@@ -212,10 +213,8 @@ st.caption(f"Range: {date_label}")
 if show_debug:
     with st.expander("🛠️ View Sync Logs (Debug)", expanded=True):
         for log in debug_logs:
-            if "❌" in log or "⚠️" in log:
-                st.error(log)
-            else:
-                st.write(log)
+            if "❌" in log or "⚠️" in log: st.error(log)
+            else: st.write(log)
 
 if df.empty:
     st.warning(f"No bookings found.")
@@ -234,7 +233,10 @@ if view_mode == "💰 Revenue & Profit":
     m3.metric("Net Profit", f"${net_profit:,.0f}")
     
     with st.expander("🔎 Inspect Revenue Source"):
-        st.dataframe(active_df[['Event Date', 'Customer', 'Room', 'Paid Amount']], use_container_width=True)
+        insp_df = active_df[['Event Date', 'Customer', 'Room', 'Paid Amount']].copy()
+        insp_df['Event Date'] = insp_df['Event Date'].dt.strftime('%Y-%m-%d')
+        insp_df['Paid Amount'] = insp_df['Paid Amount'].apply(lambda x: f"${x:,.2f}")
+        st.dataframe(insp_df, use_container_width=True, hide_index=True)
 
     st.divider()
     if not active_df.empty:
@@ -245,10 +247,9 @@ if view_mode == "💰 Revenue & Profit":
         day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
         c2.bar_chart(active_df.groupby("Day")["Paid Amount"].sum().reindex(day_order), color="#636EFA")
 
-# === VIEW 2: TRENDS (MOM & YOY) ===
+# === VIEW 2: TRENDS ===
 elif view_mode == "📈 Business Trends (MoM)":
     active_df = df[df['Status'] != "Cancelled"].copy()
-    
     monthly_data = active_df.groupby("Month")["Paid Amount"].sum().reset_index()
     monthly_data = monthly_data.sort_values("Month")
     monthly_data['Growth %'] = monthly_data['Paid Amount'].pct_change() * 100
@@ -257,18 +258,11 @@ elif view_mode == "📈 Business Trends (MoM)":
     st.line_chart(monthly_data.set_index("Month")["Paid Amount"], color="#00CC96")
     
     st.divider()
-    
     st.subheader("📅 Month-over-Month Performance")
     display_trend = monthly_data.copy()
     display_trend['Paid Amount'] = display_trend['Paid Amount'].apply(lambda x: f"${x:,.0f}")
     display_trend['Growth %'] = display_trend['Growth %'].apply(lambda x: f"{x:+.1f}%" if pd.notnull(x) else "-")
-    
-    st.dataframe(
-        display_trend,
-        column_order=("Month", "Paid Amount", "Growth %"),
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(display_trend, use_container_width=True, hide_index=True)
 
 # === VIEW 3: PIPELINE ===
 elif view_mode == "🚀 Pipeline (Future)":
@@ -282,7 +276,7 @@ elif view_mode == "🚀 Pipeline (Future)":
         k1.metric("Uncollected (Pay at Door)", f"${pending_collection:,.0f}")
         k2.metric("Deposits Held", f"${deposits_held:,.0f}")
         k3.metric("Pending Bookings", len(pipeline_df))
-        st.dataframe(pipeline_df[["Event Date", "Customer", "Room", "Status", "Outstanding"]], use_container_width=True)
+        st.dataframe(pipeline_df[["Event Date", "Customer", "Room", "Status", "Outstanding"]], use_container_width=True, hide_index=True)
 
 # === VIEW 4: CANCELLATIONS ===
 elif view_mode == "📉 Cancellation Analysis":
@@ -294,4 +288,4 @@ elif view_mode == "📉 Cancellation Analysis":
         m1, m2 = st.columns(2)
         m1.metric("Lost Revenue", f"${lost_rev:,.0f}")
         m1.metric("Count", len(cancel_df))
-        st.dataframe(cancel_df[["Event Date", "Customer", "Room", "Lead Days"]], use_container_width=True)
+        st.dataframe(cancel_df[["Event Date", "Customer", "Room", "Lead Days"]], use_container_width=True, hide_index=True)
