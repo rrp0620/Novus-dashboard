@@ -5,9 +5,8 @@ import time
 from datetime import datetime, timedelta
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Novus Command Center", page_icon="🗝️", layout="wide")
+st.set_page_config(page_title="Novus Salesforce", page_icon="🗝️", layout="wide")
 
-# Retrieve Keys
 try:
     API_KEY = st.secrets["API_KEY"]
     SECRET_KEY = st.secrets["SECRET_KEY"]
@@ -20,40 +19,33 @@ SHEET_ID = "1f79HfLYphC8X3JHjLNxleia6weOJQr-YMbisLk69Pj4"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
 EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 
-# --- 3. SIDEBAR CONTROLS ---
+# --- 3. SIDEBAR ---
 with st.sidebar:
-    st.header("🔍 Filters")
-    
-    # Date Range Picker (Default to last 30 days)
+    st.title("🔍 Filters")
     today = datetime.now()
     default_start = today - timedelta(days=30)
     
-    date_range = st.date_input(
-        "Select Date Range",
-        (default_start, today),
-        format="MM/DD/YYYY"
-    )
-    
-    # Handle the case where user picks only one date so far
+    date_range = st.date_input("Select Period", (default_start, today), format="MM/DD/YYYY")
     if len(date_range) == 2:
         start_val, end_val = date_range
     else:
         start_val, end_val = default_start, today
 
-    st.info("💡 Tip: Shorter ranges load faster.")
+    st.divider()
+    view_mode = st.radio("Select View:", ["💰 Revenue & Profit", "🚀 Pipeline (Future)", "📉 Cancellation Analysis"])
 
-# --- 4. DATA ENGINE (Dynamic) ---
+    date_label = f"{start_val.strftime('%b %d')} - {end_val.strftime('%b %d, %Y')}"
+
+# --- 4. DATA ENGINE ---
 @st.cache_data(ttl=600)
 def fetch_bookeo(start_d, end_d):
-    # Convert Sidebar Dates to Bookeo Format
     start_str = start_d.strftime("%Y-%m-%dT00:00:00Z")
-    end_str = end_d.strftime("%Y-%m-%dT23:59:59Z") # End of day
+    end_str = end_d.strftime("%Y-%m-%dT23:59:59Z")
 
     all_bookings = []
     page_token = ""
     
-    # Safety Cap: 10 Pages (1000 bookings max) to prevent crashing
-    for _ in range(10): 
+    for _ in range(15): # Deep scan (1500 bookings max)
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
@@ -61,8 +53,7 @@ def fetch_bookeo(start_d, end_d):
                f"&endTime={end_str}"
                f"&itemsPerPage=100")
         
-        if page_token:
-            url += f"&pageNavigationToken={page_token}"
+        if page_token: url += f"&pageNavigationToken={page_token}"
 
         try:
             response = requests.get(url)
@@ -72,7 +63,7 @@ def fetch_bookeo(start_d, end_d):
                 all_bookings.extend(bookings)
                 page_token = data.get('info', {}).get('pageNavigationToken')
                 if not page_token: break
-                time.sleep(1) # Polite pause
+                time.sleep(1)
             else:
                 break
         except:
@@ -90,137 +81,156 @@ def fetch_expenses():
     except:
         return pd.DataFrame(columns=["Date", "Category", "Amount"])
 
-# --- 5. LOAD DATA ---
-with st.spinner('Syncing Data...'):
+with st.spinner(f'Processing Financials for {date_label}...'):
     raw_bookings = fetch_bookeo(start_val, end_val)
     raw_expenses = fetch_expenses()
 
-# --- 6. PROCESS DATA INTO DATAFRAME ---
+# --- 5. INTELLIGENT PROCESSING ---
+data_list = []
+
 if raw_bookings:
-    data_list = []
     for b in raw_bookings:
-        # Extract Price
-        gross = b.get('price', {}).get('totalGross', {})
-        val = float(gross.get('amount', 0))
+        # 1. Money Logic
+        price_info = b.get('price', {})
+        total_gross = float(price_info.get('totalGross', {}).get('amount', 0))
+        total_paid = float(price_info.get('totalPaid', {}).get('amount', 0))
         
-        # Extract Dates
+        # 2. Status Logic
+        is_canceled = b.get('canceled', False)
+        
+        if is_canceled:
+            status = "Cancelled"
+        elif total_paid >= total_gross and total_gross > 0:
+            status = "Fully Paid"
+        elif total_paid > 0 and total_paid < total_gross:
+            status = "Partially Paid"
+        else:
+            status = "Unpaid"
+
+        # 3. Dates
         created = pd.to_datetime(b.get('creationTime', '')[:10])
         event = pd.to_datetime(b.get('startTime', '')[:10])
-        
-        # Lead Time (Days between booking and playing)
         lead_time = (event - created).days
-        
-        # Extract Participants
+
+        # 4. Room & People
+        room_name = b.get('productName', 'Unknown')
         part_list = b.get('participants', {}).get('numbers', [])
         count = sum([p.get('number', 0) for p in part_list])
 
         data_list.append({
             "Event Date": event,
-            "Room": b.get('productName', 'Unknown'),
-            "Revenue": val,
+            "Room": room_name,
+            "Total Price": total_gross,
+            "Paid Amount": total_paid,
+            "Outstanding": total_gross - total_paid,
+            "Status": status,
             "Participants": count,
             "Lead Days": lead_time,
             "Customer": b.get('title', 'Unknown'),
-            "Day": event.strftime("%A") # Monday, Tuesday...
+            "Day": event.strftime("%A")
         })
-    
-    df = pd.DataFrame(data_list)
-else:
-    df = pd.DataFrame()
 
-# --- 7. FILTERING LOGIC ---
-if not df.empty:
-    with st.sidebar:
-        st.divider()
-        st.header("🎯 Drill Down")
-        
-        # Room Filter
-        all_rooms = ["All Rooms"] + list(df['Room'].unique())
-        selected_room = st.selectbox("Filter by Room:", all_rooms)
-        
-        if selected_room != "All Rooms":
-            df = df[df['Room'] == selected_room]
-            
-        # Participant Filter
-        min_p, max_p = int(df['Participants'].min()), int(df['Participants'].max())
-        if min_p < max_p:
-            p_range = st.slider("Group Size:", min_p, max_p, (min_p, max_p))
-            df = df[(df['Participants'] >= p_range[0]) & (df['Participants'] <= p_range[1])]
+df = pd.DataFrame(data_list)
 
-# Filter Expenses by Date
+# Expense Filter
 if not raw_expenses.empty:
     mask = (raw_expenses['Date'] >= pd.to_datetime(start_val)) & (raw_expenses['Date'] <= pd.to_datetime(end_val))
     filtered_expenses = raw_expenses.loc[mask]
 else:
     filtered_expenses = pd.DataFrame()
 
-# --- 8. DASHBOARD LAYOUT ---
-st.title("📊 Novus Command Center")
+# --- 6. DASHBOARD VIEWS ---
+st.title(f"{view_mode}")
+st.caption(f"Range: {date_label}")
 
 if df.empty:
-    st.warning("No bookings found for this period. Try extending the date range.")
+    st.warning("No data found.")
     st.stop()
 
-# TOP METRICS
-total_rev = df['Revenue'].sum()
-total_exp = filtered_expenses['Amount'].sum() if not filtered_expenses.empty else 0
-net_profit = total_rev - total_exp
-avg_order = df['Revenue'].mean()
-total_games = len(df)
+# === VIEW 1: REVENUE (Real Money Only) ===
+if view_mode == "💰 Revenue & Profit":
+    # Filter: Only count realized revenue (Paid + Partial portions)
+    # We EXCLUDE "Cancelled" completely from this view
+    active_df = df[df['Status'] != "Cancelled"]
+    
+    # Revenue = Actual money collected (Paid Amount), NOT Total Price
+    real_revenue = active_df['Paid Amount'].sum()
+    total_exp = filtered_expenses['Amount'].sum()
+    net_profit = real_revenue - total_exp
+    
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Real Revenue (Collected)", f"${real_revenue:,.0f}")
+    m2.metric("Expenses", f"${total_exp:,.0f}")
+    m3.metric("Net Profit", f"${net_profit:,.0f}", delta=f"Margin: {(net_profit/real_revenue*100) if real_revenue else 0:.1f}%")
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Net Profit", f"${net_profit:,.0f}", delta=f"Rev: ${total_rev:,.0f}")
-m2.metric("Total Games", total_games)
-m3.metric("Avg Order Value", f"${avg_order:.0f}")
-m4.metric("Expenses", f"${total_exp:,.0f}")
+    st.divider()
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Revenue by Room")
+        st.bar_chart(active_df.groupby("Room")["Paid Amount"].sum(), color="#00CC96")
+    with c2:
+        st.subheader("Revenue by Day")
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        st.bar_chart(active_df.groupby("Day")["Paid Amount"].sum().reindex(day_order), color="#636EFA")
 
-st.divider()
+# === VIEW 2: PIPELINE (The "Gap") ===
+elif view_mode == "🚀 Pipeline (Future)":
+    # Filter: Partially Paid or Unpaid (but NOT cancelled)
+    pipeline_df = df[(df['Status'].isin(["Partially Paid", "Unpaid"])) & (df['Status'] != "Cancelled")]
+    
+    pending_collection = pipeline_df['Outstanding'].sum()
+    deposits_held = pipeline_df['Paid Amount'].sum()
+    
+    st.info("💡 **Pipeline** shows money for bookings that haven't fully paid yet (e.g. Pay at Door or Deposits).")
+    
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Uncollected (Pay at Door)", f"${pending_collection:,.0f}", delta="Potential Revenue")
+    k2.metric("Deposits Held", f"${deposits_held:,.0f}")
+    k3.metric("Pending Bookings", len(pipeline_df))
+    
+    st.divider()
+    st.subheader("📝 Pending Payments List")
+    st.dataframe(
+        pipeline_df[["Event Date", "Customer", "Room", "Status", "Outstanding"]].sort_values("Event Date"),
+        use_container_width=True,
+        hide_index=True
+    )
 
-# CHARTS ROW 1
-c1, c2 = st.columns(2)
-
-with c1:
-    st.subheader("💰 Revenue by Room")
-    # Group by Room and Sum Revenue
-    room_rev = df.groupby("Room")["Revenue"].sum().sort_values(ascending=False)
-    st.bar_chart(room_rev, color="#00CC96") # Green bars
-
-with c2:
-    st.subheader("📅 Busiest Days")
-    # Sort days correctly (Mon -> Sun)
-    days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    day_counts = df['Day'].value_counts().reindex(days_order).fillna(0)
-    st.bar_chart(day_counts, color="#636EFA") # Blue bars
-
-# CHARTS ROW 2
-c3, c4 = st.columns(2)
-
-with c3:
-    st.subheader("👥 Group Size Trends")
-    st.caption("Are we getting couples or parties?")
-    # Simple histogram of participants
-    group_data = df['Participants'].value_counts().sort_index()
-    st.bar_chart(group_data)
-
-with c4:
-    st.subheader("⏳ Booking Lead Time")
-    st.caption("0 = Same Day Walk-in")
-    # Average Lead time per Room
-    lead_data = df.groupby("Room")["Lead Days"].mean()
-    st.bar_chart(lead_data)
-
-st.divider()
-
-# DETAILED TABLE
-st.subheader("📝 Booking Log")
-# Format for display
-display_df = df.copy()
-display_df['Event Date'] = display_df['Event Date'].dt.strftime('%Y-%m-%d')
-display_df['Revenue'] = display_df['Revenue'].apply(lambda x: f"${x:,.2f}")
-
-st.dataframe(
-    display_df,
-    column_order=("Event Date", "Room", "Customer", "Participants", "Revenue", "Lead Days", "Day"),
-    hide_index=True,
-    use_container_width=True
-)
+# === VIEW 3: CANCELLATION INTELLIGENCE ===
+elif view_mode == "📉 Cancellation Analysis":
+    cancel_df = df[df['Status'] == "Cancelled"]
+    total_bookings = len(df)
+    cancel_count = len(cancel_df)
+    cancel_rate = (cancel_count / total_bookings * 100) if total_bookings > 0 else 0
+    lost_revenue = cancel_df['Total Price'].sum()
+    
+    # Insights
+    avg_lead_cancel = cancel_df['Lead Days'].mean() if not cancel_df.empty else 0
+    avg_lead_all = df['Lead Days'].mean()
+    
+    st.error(f"⚠️ You have lost **${lost_revenue:,.0f}** to cancellations in this period.")
+    
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Cancellation Rate", f"{cancel_rate:.1f}%")
+    m2.metric("Lost Bookings", cancel_count)
+    m3.metric("Avg Lead Time (Cancelled)", f"{avg_lead_cancel:.1f} days", help="How many days in advance cancelled bookings were made.")
+    
+    st.divider()
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Which Room gets cancelled most?")
+        st.bar_chart(cancel_df['Room'].value_counts(), color="#EF553B")
+        
+    with c2:
+        st.subheader("Lead Time Analysis")
+        st.write(f"Average Booking Lead Time: **{avg_lead_all:.1f} days**")
+        st.write(f"Average Cancelled Lead Time: **{avg_lead_cancel:.1f} days**")
+        if avg_lead_cancel < 2:
+            st.warning("⚠️ **Insight:** People are cancelling last-minute bookings. Consider a stricter deposit policy for bookings made <48h out.")
+        elif avg_lead_cancel > 14:
+            st.warning("⚠️ **Insight:** People booking far in advance are cancelling. Send them a reminder email 1 week before to re-confirm.")
+            
+    st.subheader("Recent Cancellations")
+    st.dataframe(cancel_df[["Event Date", "Customer", "Room", "Lead Days", "Total Price"]], use_container_width=True)
