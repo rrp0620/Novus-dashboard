@@ -23,7 +23,7 @@ EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 with st.sidebar:
     st.title("🔍 Filters")
     
-    # Defaults: Current Year to Date
+    # Defaults: Year to Date
     today = datetime.now()
     start_of_year = today.replace(month=1, day=1)
     
@@ -42,60 +42,70 @@ with st.sidebar:
     )
     date_label = f"{start_val.strftime('%b %d, %Y')} - {end_val.strftime('%b %d, %Y')}"
 
-# --- 4. DATA ENGINE (FIXED) ---
+# --- 4. DATA ENGINE (SMART CHUNKING) ---
 @st.cache_data(ttl=900) 
 def fetch_bookeo(start_d, end_d):
-    # FIX: Convert 'date' objects to 'datetime' before formatting
-    # This prevents the crash that caused "No bookings found"
-    start_dt = datetime.combine(start_d, datetime.min.time())
-    end_dt = datetime.combine(end_d, datetime.max.time())
-    
-    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
     all_bookings = []
-    page_token = ""
     
-    progress_text = "Downloading Data..."
-    my_bar = st.progress(0, text=progress_text)
+    # Convert to datetime for math
+    current_start = datetime.combine(start_d, datetime.min.time())
+    final_end = datetime.combine(end_d, datetime.max.time())
     
-    max_pages = 100
+    # Progress UI
+    progress_bar = st.progress(0, text="Initializing Smart Sync...")
+    total_days = (final_end - current_start).days
+    if total_days == 0: total_days = 1
     
-    for i in range(max_pages): 
-        url = (f"https://api.bookeo.com/v2/bookings"
-               f"?apiKey={API_KEY}"
-               f"&secretKey={SECRET_KEY}"
-               f"&startTime={start_str}"
-               f"&endTime={end_str}"
-               f"&itemsPerPage=100")
-        
-        if page_token: url += f"&pageNavigationToken={page_token}"
-
-        try:
-            response = requests.get(url)
-            if response.status_code == 200:
-                data = response.json()
-                bookings = data.get('data', [])
-                if not bookings: break
-                
-                all_bookings.extend(bookings)
-                
-                percent_complete = min((i + 1) / 20, 1.0)
-                my_bar.progress(percent_complete, text=f"Fetched {len(all_bookings)} bookings...")
-                
-                page_token = data.get('info', {}).get('pageNavigationToken')
-                if not page_token: break
-                
-                time.sleep(0.2) 
-            else:
-                # If error, print it to the UI for debugging
-                st.error(f"API Error: {response.status_code} - {response.text}")
-                break
-        except Exception as e:
-            st.error(f"Connection Error: {e}")
-            break
+    # --- CHUNKING LOOP ---
+    # We loop through the requested range in 30-day blocks
+    while current_start < final_end:
+        # Define the end of this 30-day chunk
+        chunk_end = current_start + timedelta(days=30)
+        if chunk_end > final_end:
+            chunk_end = final_end
             
-    my_bar.empty()
+        # UI Update
+        days_done = (current_start - datetime.combine(start_d, datetime.min.time())).days
+        pct = min(days_done / total_days, 1.0)
+        progress_bar.progress(pct, text=f"Scanning {current_start.strftime('%b %Y')}...")
+        
+        # Prepare API strings for this chunk
+        start_str = current_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str = chunk_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        page_token = ""
+        
+        # --- PAGINATION INNER LOOP ---
+        for _ in range(20): # Safety limit per month (2000 bookings/month)
+            url = (f"https://api.bookeo.com/v2/bookings"
+                   f"?apiKey={API_KEY}"
+                   f"&secretKey={SECRET_KEY}"
+                   f"&startTime={start_str}"
+                   f"&endTime={end_str}"
+                   f"&itemsPerPage=100")
+            
+            if page_token: url += f"&pageNavigationToken={page_token}"
+
+            try:
+                response = requests.get(url)
+                if response.status_code == 200:
+                    data = response.json()
+                    bookings = data.get('data', [])
+                    all_bookings.extend(bookings)
+                    
+                    page_token = data.get('info', {}).get('pageNavigationToken')
+                    if not page_token: break
+                    time.sleep(0.1)
+                else:
+                    # If error, break inner loop to try next chunk
+                    break 
+            except:
+                break
+        
+        # Advance to next chunk (Move start forward)
+        current_start = chunk_end + timedelta(seconds=1)
+            
+    progress_bar.empty()
     return all_bookings
 
 def fetch_expenses():
@@ -156,6 +166,7 @@ if raw_bookings:
 
 df = pd.DataFrame(data_list)
 if not df.empty:
+    # Important: Chunking might create slight overlaps, deduplication fixes it
     df.drop_duplicates(subset=['Booking ID'], inplace=True)
     df.sort_values(by="Event Date", ascending=False, inplace=True)
 
@@ -172,7 +183,6 @@ st.caption(f"Range: {date_label}")
 
 if df.empty:
     st.warning(f"No bookings found.")
-    st.info("Debugging: If you see this, the API returned an empty list. Try a shorter date range (e.g., last 30 days) to test connection.")
     st.stop()
 
 # === VIEW 1: REVENUE & PROFIT ===
