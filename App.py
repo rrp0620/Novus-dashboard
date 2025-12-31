@@ -16,7 +16,7 @@ except:
 
 # GOOGLE SHEET CONFIG (Replace with your actual Sheet ID below)
 # Example ID: 1BxiM_9_random_letters_7s
-SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE" 
+SHEET_ID = "1f79HfLYphC8X3JHjLNxleia6weOJQr-YMbisLk69Pj4" 
 
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv"
 EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
