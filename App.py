@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 
 # --- 1. SETUP ---
-st.set_page_config(page_title="Novus Salesforce", page_icon="🗝️", layout="wide")
+st.set_page_config(page_title="Novus Analytics", page_icon="🗝️", layout="wide")
 
 try:
     API_KEY = st.secrets["API_KEY"]
@@ -22,21 +22,28 @@ EDIT_LINK = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 # --- 3. SIDEBAR ---
 with st.sidebar:
     st.title("🔍 Filters")
-    today = datetime.now()
-    default_start = today - timedelta(days=30)
     
-    date_range = st.date_input("Select Period", (default_start, today), format="MM/DD/YYYY")
+    # Defaults: Current Year to Date
+    today = datetime.now()
+    start_of_year = datetime(today.year, 1, 1)
+    
+    date_range = st.date_input("Select Period", (start_of_year, today), format="MM/DD/YYYY")
     if len(date_range) == 2:
         start_val, end_val = date_range
     else:
-        start_val, end_val = default_start, today
+        start_val, end_val = start_of_year, today
 
     st.divider()
-    view_mode = st.radio("Select View:", ["💰 Revenue & Profit", "🚀 Pipeline (Future)", "📉 Cancellation Analysis"])
-    date_label = f"{start_val.strftime('%b %d')} - {end_val.strftime('%b %d, %Y')}"
+    view_mode = st.radio("Select View:", 
+        ["💰 Revenue & Profit", 
+         "📈 Business Trends (MoM)", 
+         "🚀 Pipeline (Future)", 
+         "📉 Cancellation Analysis"]
+    )
+    date_label = f"{start_val.strftime('%b %d, %Y')} - {end_val.strftime('%b %d, %Y')}"
 
-# --- 4. DATA ENGINE ---
-@st.cache_data(ttl=600)
+# --- 4. DATA ENGINE (HEAVY DUTY) ---
+@st.cache_data(ttl=900) # Cache for 15 mins
 def fetch_bookeo(start_d, end_d):
     start_str = start_d.strftime("%Y-%m-%dT00:00:00Z")
     end_str = end_d.strftime("%Y-%m-%dT23:59:59Z")
@@ -44,8 +51,14 @@ def fetch_bookeo(start_d, end_d):
     all_bookings = []
     page_token = ""
     
-    # Loop safely
-    for _ in range(15): 
+    # Progress Bar UI
+    progress_text = "Downloading Data..."
+    my_bar = st.progress(0, text=progress_text)
+    
+    # CAPACITY: 100 Pages = ~10,000 Bookings (Enough for a busy year)
+    max_pages = 100
+    
+    for i in range(max_pages): 
         url = (f"https://api.bookeo.com/v2/bookings"
                f"?apiKey={API_KEY}"
                f"&secretKey={SECRET_KEY}"
@@ -60,17 +73,24 @@ def fetch_bookeo(start_d, end_d):
             if response.status_code == 200:
                 data = response.json()
                 bookings = data.get('data', [])
-                if not bookings: break # Stop if empty list
+                if not bookings: break
                 
                 all_bookings.extend(bookings)
                 
+                # Update Progress Bar
+                percent_complete = min((i + 1) / 20, 1.0) # Estimate 20 pages is common
+                my_bar.progress(percent_complete, text=f"Fetched {len(all_bookings)} bookings...")
+                
                 page_token = data.get('info', {}).get('pageNavigationToken')
                 if not page_token: break
-                time.sleep(1)
+                
+                time.sleep(0.2) # Slight speed up
             else:
                 break
         except:
             break
+            
+    my_bar.empty() # Clear bar when done
     return all_bookings
 
 def fetch_expenses():
@@ -87,16 +107,14 @@ def fetch_expenses():
     except:
         return default_df
 
-with st.spinner(f'Processing Financials for {date_label}...'):
-    raw_bookings = fetch_bookeo(start_val, end_val)
-    raw_expenses = fetch_expenses()
+# Trigger Fetch
+raw_bookings = fetch_bookeo(start_val, end_val)
+raw_expenses = fetch_expenses()
 
-# --- 5. INTELLIGENT PROCESSING ---
+# --- 5. PROCESSING ---
 data_list = []
-
 if raw_bookings:
     for b in raw_bookings:
-        # Extract unique ID to prevent duplicates
         booking_id = b.get('bookingNumber')
         
         price_info = b.get('price', {})
@@ -104,7 +122,6 @@ if raw_bookings:
         total_paid = float(price_info.get('totalPaid', {}).get('amount', 0))
         
         is_canceled = b.get('canceled', False)
-        
         if is_canceled: status = "Cancelled"
         elif total_paid >= total_gross and total_gross > 0: status = "Fully Paid"
         elif total_paid > 0: status = "Partially Paid"
@@ -119,7 +136,7 @@ if raw_bookings:
         count = sum([p.get('number', 0) for p in part_list])
 
         data_list.append({
-            "Booking ID": booking_id, # Key for deduplication
+            "Booking ID": booking_id,
             "Event Date": event,
             "Room": room_name,
             "Total Price": total_gross,
@@ -129,97 +146,115 @@ if raw_bookings:
             "Participants": count,
             "Lead Days": lead_time,
             "Customer": b.get('title', 'Unknown'),
-            "Day": event.strftime("%A")
+            "Day": event.strftime("%A"),
+            "Month": event.strftime("%Y-%m") # For Grouping
         })
 
 df = pd.DataFrame(data_list)
-
-# --- CRITICAL FIX: REMOVE DUPLICATES ---
 if not df.empty:
     df.drop_duplicates(subset=['Booking ID'], inplace=True)
+    df.sort_values(by="Event Date", ascending=False, inplace=True)
 
-# Expense Filtering
+# Expense Filter
 if not raw_expenses.empty and 'Date' in raw_expenses.columns:
     mask = (raw_expenses['Date'] >= pd.to_datetime(start_val)) & (raw_expenses['Date'] <= pd.to_datetime(end_val))
     filtered_expenses = raw_expenses.loc[mask]
 else:
     filtered_expenses = pd.DataFrame(columns=["Date", "Category", "Amount"])
 
-# --- 6. DASHBOARD VIEWS ---
+# --- 6. VIEWS ---
 st.title(f"{view_mode}")
 st.caption(f"Range: {date_label}")
 
 if df.empty:
-    st.warning("No Bookeo data found for this period.")
+    st.warning(f"No bookings found.")
+    st.stop()
 
-# === VIEW 1: REVENUE (Real Money Only) ===
+# === VIEW 1: REVENUE & PROFIT ===
 if view_mode == "💰 Revenue & Profit":
-    # Only show non-cancelled
-    active_df = df[df['Status'] != "Cancelled"] if not df.empty else df
-    
+    active_df = df[df['Status'] != "Cancelled"]
     real_revenue = active_df['Paid Amount'].sum() if not active_df.empty else 0
     total_exp = filtered_expenses['Amount'].sum() if not filtered_expenses.empty else 0
     net_profit = real_revenue - total_exp
     
     m1, m2, m3 = st.columns(3)
-    m1.metric("Real Revenue (Collected)", f"${real_revenue:,.0f}")
+    m1.metric("Revenue (Collected)", f"${real_revenue:,.0f}")
     m2.metric("Expenses", f"${total_exp:,.0f}")
     m3.metric("Net Profit", f"${net_profit:,.0f}")
-
-    # --- REVENUE INSPECTOR ---
-    with st.expander("🔎 Click here to see where this money comes from"):
-        st.write("These are the individual bookings summed up above:")
-        insp_df = active_df[['Event Date', 'Customer', 'Room', 'Paid Amount']].sort_values(by='Paid Amount', ascending=False)
-        # Format for display
-        insp_df['Event Date'] = insp_df['Event Date'].dt.strftime('%Y-%m-%d')
-        insp_df['Paid Amount'] = insp_df['Paid Amount'].apply(lambda x: f"${x:,.2f}")
-        st.dataframe(insp_df, use_container_width=True, hide_index=True)
+    
+    with st.expander("🔎 Inspect Revenue Source"):
+        st.dataframe(active_df[['Event Date', 'Customer', 'Room', 'Paid Amount']], use_container_width=True)
 
     st.divider()
-    
     if not active_df.empty:
         c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("Revenue by Room")
-            st.bar_chart(active_df.groupby("Room")["Paid Amount"].sum(), color="#00CC96")
-        with c2:
-            st.subheader("Revenue by Day")
-            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            st.bar_chart(active_df.groupby("Day")["Paid Amount"].sum().reindex(day_order), color="#636EFA")
+        c1.subheader("Revenue by Room")
+        c1.bar_chart(active_df.groupby("Room")["Paid Amount"].sum(), color="#00CC96")
+        c2.subheader("Revenue by Day")
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        c2.bar_chart(active_df.groupby("Day")["Paid Amount"].sum().reindex(day_order), color="#636EFA")
 
-# === VIEW 2: PIPELINE ===
-elif view_mode == "🚀 Pipeline (Future)":
-    if df.empty:
-        st.info("No data.")
-        st.stop()
-    pipeline_df = df[(df['Status'].isin(["Partially Paid", "Unpaid"])) & (df['Status'] != "Cancelled")]
-    pending_collection = pipeline_df['Outstanding'].sum()
-    deposits_held = pipeline_df['Paid Amount'].sum()
+# === VIEW 2: TRENDS (MOM & YOY) ===
+elif view_mode == "📈 Business Trends (MoM)":
+    active_df = df[df['Status'] != "Cancelled"].copy()
     
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Uncollected (Pay at Door)", f"${pending_collection:,.0f}")
-    k2.metric("Deposits Held", f"${deposits_held:,.0f}")
-    k3.metric("Pending Bookings", len(pipeline_df))
+    # Group by Month
+    # We use the 'Month' string column we created: "2024-01", "2024-02"
+    monthly_data = active_df.groupby("Month")["Paid Amount"].sum().reset_index()
+    monthly_data = monthly_data.sort_values("Month")
+    
+    # Calculate Growth
+    monthly_data['Growth %'] = monthly_data['Paid Amount'].pct_change() * 100
+    
+    st.subheader("📊 Monthly Revenue Curve")
+    st.line_chart(monthly_data.set_index("Month")["Paid Amount"], color="#00CC96")
     
     st.divider()
-    st.subheader("📝 Pending Payments List")
-    st.dataframe(pipeline_df[["Event Date", "Customer", "Room", "Status", "Outstanding"]].sort_values("Event Date"), use_container_width=True)
+    
+    st.subheader("📅 Month-over-Month Performance")
+    # Display as a clean table
+    display_trend = monthly_data.copy()
+    display_trend['Paid Amount'] = display_trend['Paid Amount'].apply(lambda x: f"${x:,.0f}")
+    display_trend['Growth %'] = display_trend['Growth %'].apply(lambda x: f"{x:+.1f}%" if pd.notnull(x) else "-")
+    
+    st.dataframe(
+        display_trend,
+        column_order=("Month", "Paid Amount", "Growth %"),
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    # Year-Over-Year Insight
+    # If we have more than 12 months of data, we can try a simple comparison
+    if len(monthly_data) >= 13:
+        current_mo = monthly_data.iloc[-1]['Paid Amount']
+        last_year_mo = monthly_data.iloc[-13]['Paid Amount']
+        yoy_growth = ((current_mo - last_year_mo) / last_year_mo) * 100
+        
+        st.info(f"💡 **YoY Insight:** You are currently tracking **{yoy_growth:+.1f}%** compared to this month last year.")
 
-# === VIEW 3: CANCELLATION ANALYSIS ===
+# === VIEW 3: PIPELINE ===
+elif view_mode == "🚀 Pipeline (Future)":
+    pipeline_df = df[(df['Status'].isin(["Partially Paid", "Unpaid"])) & (df['Status'] != "Cancelled")]
+    if pipeline_df.empty:
+        st.info("No pipeline data found.")
+    else:
+        pending_collection = pipeline_df['Outstanding'].sum()
+        deposits_held = pipeline_df['Paid Amount'].sum()
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Uncollected (Pay at Door)", f"${pending_collection:,.0f}")
+        k2.metric("Deposits Held", f"${deposits_held:,.0f}")
+        k3.metric("Pending Bookings", len(pipeline_df))
+        st.dataframe(pipeline_df[["Event Date", "Customer", "Room", "Status", "Outstanding"]], use_container_width=True)
+
+# === VIEW 4: CANCELLATIONS ===
 elif view_mode == "📉 Cancellation Analysis":
-    if df.empty:
-        st.info("No data.")
-        st.stop()
     cancel_df = df[df['Status'] == "Cancelled"]
-    total_bookings = len(df)
-    cancel_rate = (len(cancel_df) / total_bookings * 100) if total_bookings > 0 else 0
-    lost_revenue = cancel_df['Total Price'].sum()
-    
-    st.error(f"⚠️ You have lost **${lost_revenue:,.0f}** to cancellations in this period.")
-    
-    m1, m2 = st.columns(2)
-    m1.metric("Cancellation Rate", f"{cancel_rate:.1f}%")
-    m2.metric("Lost Bookings", len(cancel_df))
-    
-    st.subheader("Recent Cancellations")
-    st.dataframe(cancel_df[["Event Date", "Customer", "Room", "Lead Days", "Total Price"]], use_container_width=True)
+    if cancel_df.empty:
+        st.success("No cancellations found!")
+    else:
+        lost_rev = cancel_df['Total Price'].sum()
+        m1, m2 = st.columns(2)
+        m1.metric("Lost Revenue", f"${lost_rev:,.0f}")
+        m1.metric("Count", len(cancel_df))
+        st.dataframe(cancel_df[["Event Date", "Customer", "Room", "Lead Days"]], use_container_width=True)
