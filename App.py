@@ -25,7 +25,7 @@ with st.sidebar:
     
     # Defaults: Current Year to Date
     today = datetime.now()
-    start_of_year = datetime(today.year, 1, 1)
+    start_of_year = today.replace(month=1, day=1)
     
     date_range = st.date_input("Select Period", (start_of_year, today), format="MM/DD/YYYY")
     if len(date_range) == 2:
@@ -42,20 +42,23 @@ with st.sidebar:
     )
     date_label = f"{start_val.strftime('%b %d, %Y')} - {end_val.strftime('%b %d, %Y')}"
 
-# --- 4. DATA ENGINE (HEAVY DUTY) ---
-@st.cache_data(ttl=900) # Cache for 15 mins
+# --- 4. DATA ENGINE (FIXED) ---
+@st.cache_data(ttl=900) 
 def fetch_bookeo(start_d, end_d):
-    start_str = start_d.strftime("%Y-%m-%dT00:00:00Z")
-    end_str = end_d.strftime("%Y-%m-%dT23:59:59Z")
+    # FIX: Convert 'date' objects to 'datetime' before formatting
+    # This prevents the crash that caused "No bookings found"
+    start_dt = datetime.combine(start_d, datetime.min.time())
+    end_dt = datetime.combine(end_d, datetime.max.time())
+    
+    start_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     all_bookings = []
     page_token = ""
     
-    # Progress Bar UI
     progress_text = "Downloading Data..."
     my_bar = st.progress(0, text=progress_text)
     
-    # CAPACITY: 100 Pages = ~10,000 Bookings (Enough for a busy year)
     max_pages = 100
     
     for i in range(max_pages): 
@@ -77,20 +80,22 @@ def fetch_bookeo(start_d, end_d):
                 
                 all_bookings.extend(bookings)
                 
-                # Update Progress Bar
-                percent_complete = min((i + 1) / 20, 1.0) # Estimate 20 pages is common
+                percent_complete = min((i + 1) / 20, 1.0)
                 my_bar.progress(percent_complete, text=f"Fetched {len(all_bookings)} bookings...")
                 
                 page_token = data.get('info', {}).get('pageNavigationToken')
                 if not page_token: break
                 
-                time.sleep(0.2) # Slight speed up
+                time.sleep(0.2) 
             else:
+                # If error, print it to the UI for debugging
+                st.error(f"API Error: {response.status_code} - {response.text}")
                 break
-        except:
+        except Exception as e:
+            st.error(f"Connection Error: {e}")
             break
             
-    my_bar.empty() # Clear bar when done
+    my_bar.empty()
     return all_bookings
 
 def fetch_expenses():
@@ -116,7 +121,6 @@ data_list = []
 if raw_bookings:
     for b in raw_bookings:
         booking_id = b.get('bookingNumber')
-        
         price_info = b.get('price', {})
         total_gross = float(price_info.get('totalGross', {}).get('amount', 0))
         total_paid = float(price_info.get('totalPaid', {}).get('amount', 0))
@@ -147,7 +151,7 @@ if raw_bookings:
             "Lead Days": lead_time,
             "Customer": b.get('title', 'Unknown'),
             "Day": event.strftime("%A"),
-            "Month": event.strftime("%Y-%m") # For Grouping
+            "Month": event.strftime("%Y-%m")
         })
 
 df = pd.DataFrame(data_list)
@@ -168,6 +172,7 @@ st.caption(f"Range: {date_label}")
 
 if df.empty:
     st.warning(f"No bookings found.")
+    st.info("Debugging: If you see this, the API returned an empty list. Try a shorter date range (e.g., last 30 days) to test connection.")
     st.stop()
 
 # === VIEW 1: REVENUE & PROFIT ===
@@ -198,12 +203,8 @@ if view_mode == "💰 Revenue & Profit":
 elif view_mode == "📈 Business Trends (MoM)":
     active_df = df[df['Status'] != "Cancelled"].copy()
     
-    # Group by Month
-    # We use the 'Month' string column we created: "2024-01", "2024-02"
     monthly_data = active_df.groupby("Month")["Paid Amount"].sum().reset_index()
     monthly_data = monthly_data.sort_values("Month")
-    
-    # Calculate Growth
     monthly_data['Growth %'] = monthly_data['Paid Amount'].pct_change() * 100
     
     st.subheader("📊 Monthly Revenue Curve")
@@ -212,7 +213,6 @@ elif view_mode == "📈 Business Trends (MoM)":
     st.divider()
     
     st.subheader("📅 Month-over-Month Performance")
-    # Display as a clean table
     display_trend = monthly_data.copy()
     display_trend['Paid Amount'] = display_trend['Paid Amount'].apply(lambda x: f"${x:,.0f}")
     display_trend['Growth %'] = display_trend['Growth %'].apply(lambda x: f"{x:+.1f}%" if pd.notnull(x) else "-")
@@ -223,15 +223,6 @@ elif view_mode == "📈 Business Trends (MoM)":
         use_container_width=True,
         hide_index=True
     )
-    
-    # Year-Over-Year Insight
-    # If we have more than 12 months of data, we can try a simple comparison
-    if len(monthly_data) >= 13:
-        current_mo = monthly_data.iloc[-1]['Paid Amount']
-        last_year_mo = monthly_data.iloc[-13]['Paid Amount']
-        yoy_growth = ((current_mo - last_year_mo) / last_year_mo) * 100
-        
-        st.info(f"💡 **YoY Insight:** You are currently tracking **{yoy_growth:+.1f}%** compared to this month last year.")
 
 # === VIEW 3: PIPELINE ===
 elif view_mode == "🚀 Pipeline (Future)":
